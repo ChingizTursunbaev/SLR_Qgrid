@@ -1,3 +1,10 @@
+# slr/models/model.py (top of file)
+try:
+    from torchaudio.models.decoder import CUCTCDecoder  # optional, only if you use it
+except Exception:
+    CUCTCDecoder = None
+
+
 import copy
 import math
 from functools import partial

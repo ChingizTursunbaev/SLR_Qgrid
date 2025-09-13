@@ -15,8 +15,12 @@ import torch.distributed as dist
 from torch import inf
 import random
 
-from tensorboardX import SummaryWriter
 
+try:
+    from torch.utils.tensorboard import SummaryWriter  # preferred
+except Exception:
+    from tensorboardX import SummaryWriter             # fallback
+from tensorboardX import SummaryWriter
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
