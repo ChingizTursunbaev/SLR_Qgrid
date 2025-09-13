@@ -12,16 +12,10 @@ from torchaudio.models.decoder import CUCTCDecoder
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 
-try:
-    from .spatial_layer import SpatialLayer
-    from .temporal_layer import TemporalLayer
-    from .ffn import FeedForwardNN
-    from .stem import Stem
-except:
-    from spatial_layer import SpatialLayer
-    from temporal_layer import TemporalLayer
-    from ffn import FeedForwardNN
-    from stem import Stem
+from .temporal_layer import TemporalLayer
+from .spatial_layer import SpatialLayer
+from .ffn import FeedForwardNN
+from .stem import Stem
 
 
 class Block(nn.Module):

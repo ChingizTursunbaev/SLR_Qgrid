@@ -1,0 +1,221 @@
+{
+  "meta_path": "data/phoenix2014/train_info.npy",
+  "image_prefix": "/nas/Dataset/Phoenix/phoenix2014-release/phoenix-2014-multisigner/features/fullFrame-256x256px",
+  "qgrid_prefix": "/nas/Dataset/Phoenix/Phoenix-2014_cleaned/interpolated_original/Qgrid_npy",
+  "samples_checked": 30,
+  "failures": {
+    "no_keypoints": 30
+  },
+  "results": [
+    {
+      "fileid": "03February_2010_Wednesday_heute_default-4",
+      "folder": "train/03February_2010_Wednesday_heute_default-4/1/*.png",
+      "slug": "03February_2010_Wednesday_heute_default-4",
+      "qgrid": "03February_2010_Wednesday_heute_default-4.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "12August_2010_Thursday_tagesschau_default-8",
+      "folder": "train/12August_2010_Thursday_tagesschau_default-8/1/*.png",
+      "slug": "12August_2010_Thursday_tagesschau_default-8",
+      "qgrid": "12August_2010_Thursday_tagesschau_default-8.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "04May_2011_Wednesday_heute_default-3",
+      "folder": "train/04May_2011_Wednesday_heute_default-3/1/*.png",
+      "slug": "04May_2011_Wednesday_heute_default-3",
+      "qgrid": "04May_2011_Wednesday_heute_default-3.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "19April_2011_Tuesday_heute_default-8",
+      "folder": "train/19April_2011_Tuesday_heute_default-8/1/*.png",
+      "slug": "19April_2011_Tuesday_heute_default-8",
+      "qgrid": "19April_2011_Tuesday_heute_default-8.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "12August_2009_Wednesday_tagesschau_default-6",
+      "folder": "train/12August_2009_Wednesday_tagesschau_default-6/1/*.png",
+      "slug": "12August_2009_Wednesday_tagesschau_default-6",
+      "qgrid": "12August_2009_Wednesday_tagesschau_default-6.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "05July_2010_Monday_heute_default-0",
+      "folder": "train/05July_2010_Monday_heute_default-0/1/*.png",
+      "slug": "05July_2010_Monday_heute_default-0",
+      "qgrid": "05July_2010_Monday_heute_default-0.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "02November_2010_Tuesday_tagesschau_default-7",
+      "folder": "train/02November_2010_Tuesday_tagesschau_default-7/1/*.png",
+      "slug": "02November_2010_Tuesday_tagesschau_default-7",
+      "qgrid": "02November_2010_Tuesday_tagesschau_default-7.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "17May_2010_Monday_tagesschau_default-0",
+      "folder": "train/17May_2010_Monday_tagesschau_default-0/1/*.png",
+      "slug": "17May_2010_Monday_tagesschau_default-0",
+      "qgrid": "17May_2010_Monday_tagesschau_default-0.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "24November_2009_Tuesday_tagesschau_default-0",
+      "folder": "train/24November_2009_Tuesday_tagesschau_default-0/1/*.png",
+      "slug": "24November_2009_Tuesday_tagesschau_default-0",
+      "qgrid": "24November_2009_Tuesday_tagesschau_default-0.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "25October_2010_Monday_heute_default-1",
+      "folder": "train/25October_2010_Monday_heute_default-1/1/*.png",
+      "slug": "25October_2010_Monday_heute_default-1",
+      "qgrid": "25October_2010_Monday_heute_default-1.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "15April_2010_Thursday_tagesschau_default-7",
+      "folder": "train/15April_2010_Thursday_tagesschau_default-7/1/*.png",
+      "slug": "15April_2010_Thursday_tagesschau_default-7",
+      "qgrid": "15April_2010_Thursday_tagesschau_default-7.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "15July_2009_Wednesday_tagesschau_default-4",
+      "folder": "train/15July_2009_Wednesday_tagesschau_default-4/1/*.png",
+      "slug": "15July_2009_Wednesday_tagesschau_default-4",
+      "qgrid": "15July_2009_Wednesday_tagesschau_default-4.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "03February_2010_Wednesday_heute_default-1",
+      "folder": "train/03February_2010_Wednesday_heute_default-1/1/*.png",
+      "slug": "03February_2010_Wednesday_heute_default-1",
+      "qgrid": "03February_2010_Wednesday_heute_default-1.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "07December_2009_Monday_tagesschau_default-18",
+      "folder": "train/07December_2009_Monday_tagesschau_default-18/1/*.png",
+      "slug": "07December_2009_Monday_tagesschau_default-18",
+      "qgrid": "07December_2009_Monday_tagesschau_default-18.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "06January_2010_Wednesday_heute_default-13",
+      "folder": "train/06January_2010_Wednesday_heute_default-13/1/*.png",
+      "slug": "06January_2010_Wednesday_heute_default-13",
+      "qgrid": "06January_2010_Wednesday_heute_default-13.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "15February_2010_Monday_tagesschau_default-16",
+      "folder": "train/15February_2010_Monday_tagesschau_default-16/1/*.png",
+      "slug": "15February_2010_Monday_tagesschau_default-16",
+      "qgrid": "15February_2010_Monday_tagesschau_default-16.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "25November_2010_Thursday_tagesschau_default-11",
+      "folder": "train/25November_2010_Thursday_tagesschau_default-11/1/*.png",
+      "slug": "25November_2010_Thursday_tagesschau_default-11",
+      "qgrid": "25November_2010_Thursday_tagesschau_default-11.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "15December_2010_Wednesday_heute_default-0",
+      "folder": "train/15December_2010_Wednesday_heute_default-0/1/*.png",
+      "slug": "15December_2010_Wednesday_heute_default-0",
+      "qgrid": "15December_2010_Wednesday_heute_default-0.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "11August_2011_Thursday_heute_default-1",
+      "folder": "train/11August_2011_Thursday_heute_default-1/1/*.png",
+      "slug": "11August_2011_Thursday_heute_default-1",
+      "qgrid": "11August_2011_Thursday_heute_default-1.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "07December_2011_Wednesday_tagesschau_default-8",
+      "folder": "train/07December_2011_Wednesday_tagesschau_default-8/1/*.png",
+      "slug": "07December_2011_Wednesday_tagesschau_default-8",
+      "qgrid": "07December_2011_Wednesday_tagesschau_default-8.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "01April_2010_Thursday_tagesschau_default-6",
+      "folder": "train/01April_2010_Thursday_tagesschau_default-6/1/*.png",
+      "slug": "01April_2010_Thursday_tagesschau_default-6",
+      "qgrid": "01April_2010_Thursday_tagesschau_default-6.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "20May_2010_Thursday_tagesschau_default-3",
+      "folder": "train/20May_2010_Thursday_tagesschau_default-3/1/*.png",
+      "slug": "20May_2010_Thursday_tagesschau_default-3",
+      "qgrid": "20May_2010_Thursday_tagesschau_default-3.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "04May_2011_Wednesday_heute_default-8",
+      "folder": "train/04May_2011_Wednesday_heute_default-8/1/*.png",
+      "slug": "04May_2011_Wednesday_heute_default-8",
+      "qgrid": "04May_2011_Wednesday_heute_default-8.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "27May_2010_Thursday_tagesschau_default-9",
+      "folder": "train/27May_2010_Thursday_tagesschau_default-9/1/*.png",
+      "slug": "27May_2010_Thursday_tagesschau_default-9",
+      "qgrid": "27May_2010_Thursday_tagesschau_default-9.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "17June_2010_Thursday_tagesschau_default-19",
+      "folder": "train/17June_2010_Thursday_tagesschau_default-19/1/*.png",
+      "slug": "17June_2010_Thursday_tagesschau_default-19",
+      "qgrid": "17June_2010_Thursday_tagesschau_default-19.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "04April_2011_Monday_heute_default-15",
+      "folder": "train/04April_2011_Monday_heute_default-15/1/*.png",
+      "slug": "04April_2011_Monday_heute_default-15",
+      "qgrid": "04April_2011_Monday_heute_default-15.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "01February_2011_Tuesday_heute_default-10",
+      "folder": "train/01February_2011_Tuesday_heute_default-10/1/*.png",
+      "slug": "01February_2011_Tuesday_heute_default-10",
+      "qgrid": "01February_2011_Tuesday_heute_default-10.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "14December_2010_Tuesday_tagesschau_default-14",
+      "folder": "train/14December_2010_Tuesday_tagesschau_default-14/1/*.png",
+      "slug": "14December_2010_Tuesday_tagesschau_default-14",
+      "qgrid": "14December_2010_Tuesday_tagesschau_default-14.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "21April_2010_Wednesday_tagesschau_default-15",
+      "folder": "train/21April_2010_Wednesday_tagesschau_default-15/1/*.png",
+      "slug": "21April_2010_Wednesday_tagesschau_default-15",
+      "qgrid": "21April_2010_Wednesday_tagesschau_default-15.npy",
+      "error": "no_keypoints"
+    },
+    {
+      "fileid": "05February_2011_Saturday_tagesschau_default-5",
+      "folder": "train/05February_2011_Saturday_tagesschau_default-5/1/*.png",
+      "slug": "05February_2011_Saturday_tagesschau_default-5",
+      "qgrid": "05February_2011_Saturday_tagesschau_default-5.npy",
+      "error": "no_keypoints"
+    }
+  ]
+}
