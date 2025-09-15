@@ -43,6 +43,10 @@ def _pool_variable_1d(x: torch.Tensor, lengths: torch.Tensor, max_tokens: int, m
                 xb = xb.mean(dim=1)
             elif mode == "max":
                 xb = xb.max(dim=1).values
+            elif mode == "vote":
+                # ternary majority vote over each window (assumes roughly centered {-1,0,1} inputs)
+                s = xb.sum(dim=1)
+                xb = torch.sign(s)  # -1, 0, or 1 per feature dim
             else:
                 xb = xb.mean(dim=1)
         pooled_list.append(xb)
@@ -57,7 +61,6 @@ def _pool_variable_1d(x: torch.Tensor, lengths: torch.Tensor, max_tokens: int, m
         mask[b, :l] = False
     return out, torch.tensor(new_lens, device=device, dtype=torch.long), mask  # (B,T',D), (B,), (B,T')
 
-
 class MultiModalMamba(nn.Module):
     """
     Image frames (B, T_img, 3, H, W)
@@ -70,7 +73,9 @@ class MultiModalMamba(nn.Module):
         super().__init__()
 
         # Per-frame encoders
-        self.image_encoder = Model(**img_cfg)  # returns (B*T, D_img) or (B*T, S, D) -> we expect (B*T, D)
+        # Disable fused_add_norm & rms_norm via img_cfg provided from ddp_train_multimodal.py for stability on A100
+        self.image_encoder = Model(**img_cfg)
+
         # For qgrid we’ll project 242 -> E; we don't run the heavy image backbone on it
         embed_dim = fusion_cfg.get("embed_dim", getattr(self.image_encoder, "d_model", 512))
         self.qgrid_proj = nn.Linear(242, embed_dim)
@@ -102,7 +107,7 @@ class MultiModalMamba(nn.Module):
         fused_dim = self.img_dim + embed_dim
         self.ctc_head = nn.Linear(fused_dim, num_classes)
 
-        # Qgrid pooling limit
+        # Qgrid pooling limit + mode
         self.max_kv = fusion_cfg.get("max_kv", 512)
         self.pool_mode = fusion_cfg.get("pool_mode", "mean")
 
@@ -116,7 +121,7 @@ class MultiModalMamba(nn.Module):
         if feats.dim() == 3:
             # If encoder returns (B*T, S, D), pool S
             feats = feats.mean(dim=1)
-        feats = feats.view(B, T, -1).contiguous()  # (B, T, D)
+        feats = feats.reshape(B, T, -1).contiguous()
         return feats
 
     def forward(self, images: torch.Tensor, qgrids: torch.Tensor, keypoints: torch.Tensor,
@@ -137,20 +142,26 @@ class MultiModalMamba(nn.Module):
         kp_feat  = self.keypoint_encoder(keypoints)                        # (B, T_img, D_img)
         low_freq = img_feat + kp_feat                                      # (B, T_img, D_img)
 
-        # 3) Qgrid -> proj to attention dim, pool to ≤ max_kv, build mask
-        q_emb = self.qgrid_ln(self.qgrid_proj(qgrids))                     # (B, T_q, E)
-        if qgrid_lengths is None:
-            # assume no padding if not given
-            qgrid_lengths = torch.full((B,), q_emb.size(1), dtype=torch.long, device=device)
-        q_pooled, q_lens, q_pad_mask = _pool_variable_1d(q_emb, qgrid_lengths, max_tokens=self.max_kv, mode=self.pool_mode)
+        # 3) Qgrid -> pool to ≤ max_kv, project, build mask
+        if self.pool_mode == "vote":
+            # pool raw ternary qgrid with majority vote, then project
+            if qgrid_lengths is None:
+                qgrid_lengths = torch.full((B,), qgrids.size(1), dtype=torch.long, device=device)
+            q_emb, q_lens, q_pad_mask = _pool_variable_1d(qgrids, qgrid_lengths, max_tokens=self.max_kv, mode="vote")
+            q_emb = self.qgrid_ln(self.qgrid_proj(q_emb.float()))       # (B, T_k, E)
+        else:
+            q_emb = self.qgrid_ln(self.qgrid_proj(qgrids.float()))      # (B, T_q, E)
+            if qgrid_lengths is None:
+                qgrid_lengths = torch.full((B,), q_emb.size(1), dtype=torch.long, device=device)
+            q_emb, q_lens, q_pad_mask = _pool_variable_1d(q_emb, qgrid_lengths, max_tokens=self.max_kv, mode=self.pool_mode)
         # q_pad_mask: True=pad → pass directly to MultiheadAttention as key_padding_mask
 
         # 4) cross-attention: queries = low_freq mapped to E
         q_queries = self.to_query(low_freq)                                # (B, T_img, E)
         q_ctx, _ = self.fusion_attn(
             query=q_queries,
-            key=q_pooled,
-            value=q_pooled,
+            key=q_emb,
+            value=q_emb,
             key_padding_mask=q_pad_mask,   # shape (B, T_k), True = IGNORE
             need_weights=False
         )
@@ -160,4 +171,3 @@ class MultiModalMamba(nn.Module):
         fused = torch.cat([low_freq, q_ctx], dim=-1)                       # (B, T_img, D_img + E)
         logits = self.ctc_head(fused)                                      # (B, T_img, V)
         return logits
-

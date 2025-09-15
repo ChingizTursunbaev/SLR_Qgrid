@@ -8,19 +8,24 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import GradScaler, autocast
 from torch import optim
 
-from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
+from slr.datasets.multi_modal_datasets import (
+    MultiModalPhoenixDataset,
+    multi_modal_collate_fn,
+)
 from slr.models.multi_modal_model import MultiModalMamba
 from slr.engine import train_one_epoch, evaluate
 
+
 def parse_args():
     ap = argparse.ArgumentParser()
-    # paths
-    ap.add_argument("--image_prefix", default="/nas/Dataset/Phoenix/phoenix2014-release/phoenix-2014-multisigner/features/fullFrame-256x256px")
-    ap.add_argument("--qgrid_prefix", default="/nas/Dataset/Phoenix/Phoenix-2014_cleaned/interpolated_original/Qgrid_npy")
-    ap.add_argument("--kp_path",      default="/home/chingiz/SLR/Mamba_SLR/data/phoenix2014/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
-    ap.add_argument("--meta_dir",     default="data/phoenix2014")
-    ap.add_argument("--gloss_dict",   default="data/phoenix2014/gloss_dict_normalized.npy")
+    # paths (set your own defaults if needed)
+    ap.add_argument("--image_prefix", required=False, default="/nas/Dataset/.../fullFrame-256x256px")
+    ap.add_argument("--qgrid_prefix", required=False, default="/nas/Dataset/.../Qgrid_npy")
+    ap.add_argument("--kp_path",      required=False, default="/nas/Dataset/.../phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
+    ap.add_argument("--meta_dir",     required=False, default="data/phoenix2014")
+    ap.add_argument("--gloss_dict",   required=False, default="data/phoenix2014/gloss_dict_normalized.npy")
     ap.add_argument("--out_dir",      default="checkpoints/multimodal_ddp")
+
     # training
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -28,144 +33,180 @@ def parse_args():
     ap.add_argument("--batch_size", type=int, default=1, help="per-GPU batch size")
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--max_norm", type=float, default=1.0)
-    ap.add_argument("--accum", type=int, default=2, help="gradient accumulation steps (update_freq)")
-    ap.add_argument("--bf16", action="store_true", help="use bf16 autocast")
+    ap.add_argument("--accum", type=int, default=2, help="gradient accumulation steps")
+    ap.add_argument("--bf16", action="store_true", help="use bfloat16 autocast on A100+ (recommended)")
+
+    # model sizing
+    ap.add_argument("--d_model", type=int, default=512)
+    ap.add_argument("--n_layer", type=int, default=12)
+    ap.add_argument("--fusion_embed", type=int, default=512)
+    ap.add_argument("--fusion_heads", type=int, default=8)
+
     # fusion / pooling
-    ap.add_argument("--max_kv", type=int, default=512)
-    ap.add_argument("--pool_mode", default="mean", choices=["mean","max"])
-    # mamba cfgs could be expanded as args if needed
+    ap.add_argument("--max_kv", type=int, default=512, help="pooled qgrid length")
+    ap.add_argument("--pool_mode", default="mean", choices=["mean", "max", "vote"])
     return ap.parse_args()
+
 
 def is_main():
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
+
 def setup_dist():
     if dist.is_available() and not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+
 
 def cleanup_dist():
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
-def cosine(step, total, base_lr):
-    import math
-    return base_lr * 0.5 * (1 + math.cos(math.pi * step / max(1, total)))
 
 def main():
+    # Safer NCCL defaults
+    os.environ.setdefault("NCCL_IB_DISABLE", "1")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("MASTER_PORT", os.environ.get("MASTER_PORT", "29531"))
+
+    # Enable TF32 for extra stability/speed on A100
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
     setup_dist()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(local_rank)
     torch.backends.cudnn.benchmark = True
-    torch.manual_seed(1337 + (dist.get_rank() if dist.is_initialized() else 0))
 
-    # ----- datasets -----
+    # Different ranks get different seeds
+    base_seed = 1337
+    if dist.is_available() and dist.is_initialized():
+        torch.manual_seed(base_seed + dist.get_rank())
+    else:
+        torch.manual_seed(base_seed)
+
+    # ----- data -----
     train_ds = MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix, qgrid_prefix=args.qgrid_prefix, kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir, gloss_dict_path=args.gloss_dict, split="train", transforms=None
+        image_prefix=args.image_prefix,
+        qgrid_prefix=args.qgrid_prefix,
+        kp_path=args.kp_path,
+        meta_dir=args.meta_dir,
+        split="train",
+        gloss_dict_path=args.gloss_dict,
     )
-    dev_ds = MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix, qgrid_prefix=args.qgrid_prefix, kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir, gloss_dict_path=args.gloss_dict, split="dev", transforms=None
+    val_ds = MultiModalPhoenixDataset(
+        image_prefix=args.image_prefix,
+        qgrid_prefix=args.qgrid_prefix,
+        kp_path=args.kp_path,
+        meta_dir=args.meta_dir,
+        split="dev",
+        gloss_dict_path=args.gloss_dict,
     )
 
-    train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=False) if dist.is_initialized() else None
-    dev_sampler   = DistributedSampler(dev_ds, shuffle=False, drop_last=False) if dist.is_initialized() else None
+    if dist.is_available() and dist.is_initialized():
+        train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=False)
+        val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False)
+    else:
+        train_sampler = None
+        val_sampler = None
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
+        num_workers=args.num_workers,
         sampler=train_sampler,
-        num_workers=args.num_workers,
+        shuffle=(train_sampler is None),
         pin_memory=True,
-        collate_fn=multi_modal_collate_fn
+        drop_last=False,
+        collate_fn=multi_modal_collate_fn,
     )
-    dev_loader = DataLoader(
-        dev_ds,
+    val_loader = DataLoader(
+        val_ds,
         batch_size=args.batch_size,
-        shuffle=False,
-        sampler=dev_sampler,
         num_workers=args.num_workers,
+        sampler=val_sampler,
+        shuffle=False,
         pin_memory=True,
-        collate_fn=multi_modal_collate_fn
+        drop_last=False,
+        collate_fn=multi_modal_collate_fn,
     )
 
     # ----- model -----
-    img_cfg   = {"out_dim": 512}
-    qgrid_cfg = {"out_dim": 512}
-    kp_cfg    = {"input_dim": 242, "model_dim": 512}
-    fusion    = {"embed_dim": 512, "num_heads": 8, "dropout": 0.1, "max_kv": args.max_kv, "pool_mode": args.pool_mode}
+    img_cfg = {
+        "d_model": args.d_model,
+        "n_layer": args.n_layer,
+        "fused_add_norm": False,  # Triton fused LN off (stability)
+        "rms_norm": False,
+    }
+    qgrid_cfg = {"out_dim": args.fusion_embed}
+    kp_cfg = {"input_dim": 242, "model_dim": args.d_model}
+    fusion = {
+        "embed_dim": args.fusion_embed,
+        "num_heads": args.fusion_heads,
+        "dropout": 0.1,
+        "max_kv": args.max_kv,
+        "pool_mode": args.pool_mode,
+    }
+    num_classes = len(train_ds.gloss_dict) + 1  # CTC blank=0
 
-    num_classes = len(train_ds.gloss_dict) + 1  # blank=0
     model = MultiModalMamba(img_cfg, qgrid_cfg, kp_cfg, num_classes=num_classes, fusion_cfg=fusion).to(device)
 
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     # ----- loss/opt/amp -----
-    criterion = torch.nn.CTCLoss(blank=0, zero_infinity=True)
+    criterion = torch.nn.CTCLoss(blank=0, zero_infinity=True)  # zero_infinity helps avoid NaNs from length mismatches
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(device="cuda", enabled=not args.bf16)
-    amp_ctx = autocast(device_type="cuda", dtype=(torch.bfloat16 if args.bf16 else torch.float16))
+    amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
 
-    # ----- schedule -----
-    total_micro_steps = len(train_loader) * args.epochs
-    lr_sched = [cosine(s, total_micro_steps - 1, args.lr) for s in range(total_micro_steps)]
-
-    best_wer = float("inf")
+    best_wer = 1e9
     start = time.time()
 
     for epoch in range(args.epochs):
-        if train_sampler is not None:
+        if isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
 
         stats = train_one_epoch(
-            model=model, criterion=criterion, data_loader=train_loader, optimizer=optimizer,
-            device=device, epoch=epoch, loss_scaler=scaler, amp_autocast=amp_ctx,
-            max_norm=args.max_norm, model_ema=None, log_writer=None,
-            start_steps=epoch * len(train_loader), lr_schedule_values=lr_sched, wd_schedule_values=None,
-            num_training_steps_per_epoch=len(train_loader), update_freq=args.accum, no_amp=False, bf16=args.bf16
-        )
-
-        val_stats = evaluate(
-            data_loader=dev_loader, model=model, device=device, amp_autocast=amp_ctx,
-            gloss_dict=train_ds.gloss_dict, ds=True, no_amp=False, bf16=args.bf16
+            model=model,
+            criterion=criterion,
+            data_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            scaler=scaler,
+            amp_dtype=amp_dtype,
+            max_norm=args.max_norm,
+            accum=args.accum,
         )
 
         if is_main():
             ckpt = {
-                "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-                "optimizer": optimizer.state_dict(),
-                "scaler": scaler.state_dict(),
                 "epoch": epoch,
-                "train_stats": stats,
-                "val_stats": val_stats,
-                "config": {
-                    "batch_size_per_gpu": args.batch_size,
-                    "world_size": (dist.get_world_size() if dist.is_initialized() else 1),
-                    "lr": args.lr, "weight_decay": args.weight_decay,
-                    "fusion": fusion, "img_cfg": img_cfg, "kp_cfg": kp_cfg
-                }
+                "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+                "optim": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "args": vars(args),
             }
-            torch.save(ckpt, os.path.join(args.out_dir, f"epoch{epoch:03d}.pth"))
+            os.makedirs(args.out_dir, exist_ok=True)
+            torch.save(ckpt, os.path.join(args.out_dir, "last.pth"))
 
-            wer = float(val_stats.get("wer", 1e9))
+        wer = evaluate(model, val_loader, device)
+
+        if is_main():
             if wer < best_wer:
                 best_wer = wer
                 torch.save(ckpt, os.path.join(args.out_dir, "best.pth"))
+            print(f"[epoch {epoch}] train_loss={stats['loss']:.4f}  skipped={stats['skipped']}  val_WER={wer:.2f}  best_WER={best_wer:.2f}")
 
-            print(f"[epoch {epoch}] train_loss={stats['loss']:.4f}  val_loss={val_stats['loss']:.4f}  val_WER={wer:.2f}  best_WER={best_wer:.2f}")
-
-    dur = (time.time() - start) / 3600
     if is_main():
-        print(f"Done. ~{dur:.2f} h. Best WER: {best_wer:.2f}%  → {args.out_dir}")
+        print(f"Done in {(time.time()-start)/3600:.2f} h. Best WER: {best_wer:.2f}%  → {args.out_dir}")
 
     cleanup_dist()
+
 
 if __name__ == "__main__":
     main()
