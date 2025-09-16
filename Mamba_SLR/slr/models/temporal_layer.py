@@ -12,9 +12,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from causal_conv1d import causal_conv1d_fn
+# from causal_conv1d import causal_conv1d_fn
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
+try:
+    from causal_conv1d import causal_conv1d_fn as _native_causal_conv1d_fn
+except Exception:
+    _native_causal_conv1d_fn = None
+
+def causal_conv1d_fn(x_B_D_L, weight_D_W, bias=None, activation="none", seq_idx=None):
+    """
+    x_B_D_L: (B, D, L)
+    weight_D_W: (D, W)
+    bias: (D,)
+    """
+    if _native_causal_conv1d_fn is not None:
+        return _native_causal_conv1d_fn(
+            x_B_D_L, weight_D_W, bias=bias, activation=activation, seq_idx=seq_idx
+        )
+
+    # Fallback: depthwise 1D conv with causal padding (no future leakage)
+    import torch.nn.functional as F
+    D, W = weight_D_W.shape
+    w = weight_D_W.unsqueeze(1)  # (D,1,W)
+    y = F.conv1d(x_B_D_L, w, bias=bias, stride=1, padding=W-1, groups=D)  # (B,D,L+W-1)
+    y = y[..., :x_B_D_L.shape[-1]]  # trim back to L (causal)
+    if activation in ("silu", "swish"):
+        y = F.silu(y)
+    return y
 
 class TemporalLayer(nn.Module):
     def __init__(
