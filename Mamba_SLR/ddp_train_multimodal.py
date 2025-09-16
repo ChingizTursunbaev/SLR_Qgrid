@@ -90,13 +90,14 @@ def main():
 
     # ----- data -----
     train_ds = MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix,
-        qgrid_prefix=args.qgrid_prefix,
-        kp_path=args.kp_path,
-        meta_dir=args.meta_dir,
-        split="train",
-        gloss_dict_path=args.gloss_dict,
-    )
+    image_prefix=args.image_prefix,
+    qgrid_prefix=args.qgrid_prefix,
+    kp_path=args.kp_path,
+    meta_dir_path=args.meta_dir,         # <-- renamed kwarg
+    gloss_dict_path=args.gloss_dict,     # <-- renamed kwarg
+    split="train",
+    transforms=None,
+)
     val_ds = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
