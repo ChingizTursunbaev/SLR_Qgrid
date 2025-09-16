@@ -3,11 +3,9 @@ annotated-types==0.7.0
 asttokens==3.0.0
 attrs==25.3.0
 Automat==25.4.16
-Brotli @ file:///home/conda/feedstock_root/build_artifacts/brotli-split_1749229842835/work
 buildtools==1.0.6
 causal-conv1d==1.5.2
 certifi==2025.6.15
-cffi @ file:///home/conda/feedstock_root/build_artifacts/cffi_1725560520483/work
 charset-normalizer==3.4.2
 click==8.2.1
 comm==0.2.2
@@ -27,15 +25,11 @@ fonttools==4.58.4
 fsspec==2024.6.1
 furl==2.1.4
 fvcore==0.1.5.post20221221
-gmpy2 @ file:///home/conda/feedstock_root/build_artifacts/gmpy2_1666808654411/work
 greenlet==3.2.4
 grpcio==1.73.0
-h2 @ file:///home/conda/feedstock_root/build_artifacts/h2_1738578511449/work
 hf-xet==1.1.4
 hjson==3.1.0
-hpack @ file:///home/conda/feedstock_root/build_artifacts/hpack_1737618293087/work
 huggingface-hub==0.33.0
-hyperframe @ file:///home/conda/feedstock_root/build_artifacts/hyperframe_1737618333194/work
 hyperlink==21.0.0
 idna==3.10
 importlib_metadata==8.7.0
@@ -99,12 +93,10 @@ ptflops==0.7.4
 ptyprocess==0.7.0
 pure_eval==0.2.3
 py-cpuinfo==9.0.0
-pycparser @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pycparser_1733195786/work
 pydantic==2.11.7
 pydantic_core==2.33.2
 Pygments==2.19.2
 pyparsing==3.2.3
-PySocks @ file:///home/conda/feedstock_root/build_artifacts/pysocks_1733217236728/work
 python-dateutil==2.9.0.post0
 pytz==2025.2
 PyYAML==6.0.2
