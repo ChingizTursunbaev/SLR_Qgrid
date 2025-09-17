@@ -36,7 +36,7 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 cd ~/Chingiz/SLR_Qgrid/Mamba_SLR
 
 torchrun --standalone --nproc_per_node=4 ddp_train_multimodal.py \
-  --batch_size 2 \
+  --batch_size 1 \
   --accum 2 \
   --num_workers 4 \
   --bf16 \
