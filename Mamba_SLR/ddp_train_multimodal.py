@@ -98,6 +98,21 @@ def cleanup_dist():
         dist.destroy_process_group()
 
 
+def _max_target_id(ds: MultiModalPhoenixDataset) -> int:
+    m = 0
+    if hasattr(ds, "gloss_dict") and isinstance(ds.gloss_dict, dict) and len(ds.gloss_dict) > 0:
+        try:
+            m = max(int(v) for v in ds.gloss_dict.values())
+        except Exception:
+            pass
+    if hasattr(ds, "id_to_gloss") and isinstance(ds.id_to_gloss, dict) and len(ds.id_to_gloss) > 0:
+        try:
+            m = max(m, max(int(k) for k in ds.id_to_gloss.keys()))
+        except Exception:
+            pass
+    return int(m)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -111,23 +126,29 @@ def main():
     base_seed = 1337
     torch.manual_seed(base_seed + (dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0))
 
-    # ---- datasets (note: pass correct kwarg names) ----
+    # ---- datasets (pass correct kwarg names) ----
     train_ds = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
         kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,           # <-- correct kwarg
-        gloss_dict_path=args.gloss_dict,       # <-- correct kwarg
+        meta_dir_path=args.meta_dir,           # correct kwarg
+        gloss_dict_path=args.gloss_dict,       # correct kwarg
         split="train",
     )
     val_ds = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
         kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,           # <-- correct kwarg
-        gloss_dict_path=args.gloss_dict,       # <-- correct kwarg
+        meta_dir_path=args.meta_dir,           # correct kwarg
+        gloss_dict_path=args.gloss_dict,       # correct kwarg
         split="dev",
     )
+
+    # Compute robust num_classes from actual max id (handles non-contiguous id spaces)
+    max_id = _max_target_id(train_ds)
+    num_classes = int(max_id) + 1  # class ids are in [0, max_id]; output dim = max_id+1
+    if _is_main():
+        print(f"[setup] max_label_id(train)={max_id} → num_classes={num_classes} (CTC blank=0)")
 
     # samplers
     if dist.is_available() and dist.is_initialized():
@@ -137,7 +158,7 @@ def main():
         train_sampler = None
         val_sampler = None
 
-    # dataloaders (corrected: collate_fn is a separate kwarg)
+    # dataloaders
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -171,14 +192,13 @@ def main():
         "pool_mode": args.pool_mode,
     }
 
-    num_classes = len(train_ds.gloss_dict) + 1  # CTC blank=0
     model = MultiModalMamba(img_cfg, qgrid_cfg, kp_cfg, num_classes=num_classes, fusion_cfg=fusion).to(device)
 
     if dist.is_available() and dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     # ---- loss/opt/amp ----
-    criterion = torch.nn.CTCLoss(blank=0, zero_infinity=True)
+    criterion = torch.nn.CTCLoss(blank=0, zero_infinity=True)  # keep blank=0 to match your eval
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(device="cuda", enabled=not args.bf16)
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -239,6 +259,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
