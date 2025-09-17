@@ -1,3 +1,163 @@
+# Mamba_SLR/ddp_train_multimodal.py
+import os
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")  # precise error sites
+
+import time
+import argparse
+from typing import Dict, Any, Tuple
+
+import torch
+import torch.distributed as dist
+from torch import optim
+from torch.amp import GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+from slr.datasets.multi_modal_datasets import (
+    MultiModalPhoenixDataset,
+    multi_modal_collate_fn,
+    load_gloss_maps,
+)
+from slr.models.multi_modal_model import MultiModalMamba
+from slr.engine import train_one_epoch, evaluate
+
+
+# ----------------------------- ID SPACE HELPERS ------------------------------ #
+def _compute_id_bounds_from_map(gloss_dict_path: str) -> Tuple[int, int]:
+    """Return (min_id, max_id) from the gloss dict file—no assumptions."""
+    gloss_to_id, id_to_gloss = load_gloss_maps(gloss_dict_path)
+    ids = []
+    if isinstance(gloss_to_id, dict) and len(gloss_to_id):
+        try:
+            ids.extend(int(v) for v in gloss_to_id.values())
+        except Exception:
+            pass
+    if isinstance(id_to_gloss, dict) and len(id_to_gloss):
+        try:
+            ids.extend(int(k) for k in id_to_gloss.keys())
+        except Exception:
+            pass
+    if not ids:
+        return 1, 1
+    return min(ids), max(ids)
+
+
+def make_collate_to_dict(shift_labels_by: int, blank_idx: int, num_classes: int):
+    """
+    Wrap repo collate to:
+      - optionally shift labels to avoid blank collision,
+      - build flat CTC targets,
+      - VALIDATE targets every batch,
+      - ***CLAMP variable-length metadata*** to the true time dims to prevent gather OOB.
+    """
+    def _collate_to_dict(samples):
+        imgs, qgrids, kps, labels, image_lengths, label_lengths, qgrid_lengths = multi_modal_collate_fn(samples)
+
+        # ---- types ----
+        if not torch.is_tensor(labels):
+            labels = torch.as_tensor(labels, dtype=torch.long)
+        if not torch.is_tensor(label_lengths):
+            label_lengths = torch.as_tensor(label_lengths, dtype=torch.long)
+        if not torch.is_tensor(image_lengths):
+            image_lengths = torch.as_tensor(image_lengths, dtype=torch.long)
+        if qgrid_lengths is not None and not torch.is_tensor(qgrid_lengths):
+            qgrid_lengths = torch.as_tensor(qgrid_lengths, dtype=torch.long)
+
+        # ---- clamp lengths to actual T ----
+        if imgs is not None and imgs.ndim >= 2:
+            T_img = int(imgs.size(1))
+            image_lengths = image_lengths.clamp(min=1, max=T_img)
+        if qgrids is not None and qgrids.ndim >= 2 and qgrid_lengths is not None:
+            T_q = int(qgrids.size(1))
+            qgrid_lengths = qgrid_lengths.clamp(min=1, max=T_q)
+
+        # ---- optional label shift ----
+        if shift_labels_by:
+            labels = labels + shift_labels_by
+
+        # ---- build flat CTC targets ----
+        parts = []
+        if labels.ndim == 2:
+            B = labels.size(0)
+            for i in range(B):
+                L = int(label_lengths[i])
+                if L > 0:
+                    parts.append(labels[i, :L])
+        targets_flat = torch.cat(parts, dim=0) if parts else torch.zeros(0, dtype=torch.long)
+
+        # ---- HARD VALIDATION (targets) ----
+        if targets_flat.numel():
+            tmin = int(targets_flat.min().item())
+            tmax = int(targets_flat.max().item())
+            if tmin < 0 or tmax >= num_classes:
+                raise RuntimeError(
+                    f"[LabelRangeError] targets min={tmin}, max={tmax}, num_classes={num_classes}. "
+                    f"shift_labels_by={shift_labels_by}, blank_idx={blank_idx}."
+                )
+            if (targets_flat == blank_idx).any().item():
+                raise RuntimeError(
+                    f"[BlankCollision] targets contain the blank index ({blank_idx}). "
+                    f"shift_labels_by={shift_labels_by}."
+                )
+
+        # ready
+        batch: Dict[str, Any] = {
+            "images": imgs,                             # (B, T_img, 3, H, W)
+            "qgrids": qgrids,                           # (B, T_q, 242) or None
+            "keypoints": kps,                           # (B, T_img, 242) or None
+            "targets": targets_flat,                    # (sum(L_i),)
+            "target_lengths": label_lengths.long(),     # (B,)
+            "qgrid_lengths": (qgrid_lengths.long() if qgrid_lengths is not None else None),  # (B,) or None
+            # Keep image_lengths in case your model uses it
+            "image_lengths": image_lengths.long(),      # (B,)
+        }
+        return batch
+    return _collate_to_dict
+# ---------------------------------------------------------------------------- #
+
+
+class SafeCTC(torch.nn.Module):
+    """
+    Wrapper around nn.CTCLoss that asserts target ranges BEFORE CUDA kernels.
+    Works whether engine passes logits or log-probs.
+    """
+    def __init__(self, blank: int, zero_infinity: bool, num_classes: int, expect_log_probs: bool = True):
+        super().__init__()
+        self.base = torch.nn.CTCLoss(blank=blank, zero_infinity=zero_infinity)
+        self.blank = int(blank)
+        self.num_classes = int(num_classes)
+        self.expect_log_probs = expect_log_probs
+
+    def forward(self, x, targets, input_lengths, target_lengths):
+        # Support (T,B,C) or (B,T,C)
+        x_bt = x.transpose(0, 1) if (x.dim() == 3 and x.size(0) != input_lengths.size(0)) else x
+        C = x_bt.size(-1)
+        if C != self.num_classes:
+            raise RuntimeError(f"[LogitsDimError] logits classes={C} but configured num_classes={self.num_classes}")
+        if targets.numel():
+            tmin = int(targets.min().item())
+            tmax = int(targets.max().item())
+            if tmin < 0 or tmax >= C:
+                raise RuntimeError(
+                    f"[CTC/TargetRangeError] targets min={tmin}, max={tmax}, classes(C)={C}. blank={self.blank}"
+                )
+            if (targets == self.blank).any().item():
+                raise RuntimeError(f"[CTC/BlankCollision] targets contain blank={self.blank}")
+        x_lp = x if self.expect_log_probs else torch.log_softmax(x, dim=-1)
+        return self.base(x_lp, targets, input_lengths, target_lengths)
+
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+
+    # data
+    ap.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
+    ap.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
+    ap.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
+    ap.add_argument("--meta_dir",     required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
+    ap.add_argument("--gloss_dict",   required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
+    ap.add_argument("--out_dir",      default="checkpoints/multimodal_ddp")
+
 # ddp_train_multimodal.py (patched for robust label/length validation & safe CTC)
 import os
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")  # surface exact kernel sites
