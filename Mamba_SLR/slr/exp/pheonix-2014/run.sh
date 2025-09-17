@@ -33,9 +33,9 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 # If your paths are different on this box, change them in ddp_train_multimodal.py or add --image_prefix/--qgrid_prefix flags here
 
-cd ~/Chingiz/SLR_Qgrid/Mamba_SLR/slr/
+cd ~/Chingiz/SLR_Qgrid/Mamba_SLR
 
-torchrun --standalone --nproc_per_node=4 main.py \
+torchrun --standalone --nproc_per_node=4 ddp_train_multimodal.py \
   --batch_size 1 \
   --accum 2 \
   --num_workers 4 \
