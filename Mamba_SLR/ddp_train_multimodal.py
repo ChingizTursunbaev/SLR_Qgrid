@@ -1,8 +1,10 @@
 # Mamba_SLR/ddp_train_multimodal.py
 import os
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")  # precise error sites
+
 import time
 import argparse
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import torch
 import torch.distributed as dist
@@ -14,52 +16,139 @@ from torch.utils.data import DataLoader, DistributedSampler
 from slr.datasets.multi_modal_datasets import (
     MultiModalPhoenixDataset,
     multi_modal_collate_fn,
+    load_gloss_maps,
 )
 from slr.models.multi_modal_model import MultiModalMamba
 from slr.engine import train_one_epoch, evaluate
 
 
-# ---- adapter: turn tuple collate into a dict the engine expects ----
-def _collate_to_dict(samples):
-    imgs, qgrids, kps, labels, image_lengths, label_lengths, qgrid_lengths = multi_modal_collate_fn(samples)
+# ----------------------------- ID SPACE HELPERS ------------------------------ #
+def _compute_id_bounds_from_map(gloss_dict_path: str) -> Tuple[int, int]:
+    """Return (min_id, max_id) from the gloss dict file—no assumptions."""
+    gloss_to_id, id_to_gloss = load_gloss_maps(gloss_dict_path)
+    ids = []
+    if isinstance(gloss_to_id, dict) and len(gloss_to_id):
+        try:
+            ids.extend(int(v) for v in gloss_to_id.values())
+        except Exception:
+            pass
+    if isinstance(id_to_gloss, dict) and len(id_to_gloss):
+        try:
+            ids.extend(int(k) for k in id_to_gloss.keys())
+        except Exception:
+            pass
+    if not ids:
+        return 1, 1
+    return min(ids), max(ids)
 
-    if not torch.is_tensor(labels):
-        labels = torch.as_tensor(labels, dtype=torch.long)
-    if not torch.is_tensor(label_lengths):
-        label_lengths = torch.as_tensor(label_lengths, dtype=torch.long)
 
-    # make flat CTC targets
-    parts = []
-    B = labels.size(0) if labels.ndim == 2 else 0
-    for i in range(B):
-        L = int(label_lengths[i])
-        if L > 0:
-            parts.append(labels[i, :L])
-    targets_flat = torch.cat(parts, dim=0) if parts else torch.zeros(0, dtype=torch.long)
+def make_collate_to_dict(shift_labels_by: int, blank_idx: int, num_classes: int):
+    """
+    Wrap repo collate to:
+      - optionally shift labels to avoid blank collision,
+      - build flat CTC targets,
+      - VALIDATE every batch: targets in [0, num_classes-1] and targets != blank_idx.
+    """
+    def _collate_to_dict(samples):
+        imgs, qgrids, kps, labels, image_lengths, label_lengths, qgrid_lengths = multi_modal_collate_fn(samples)
 
-    batch: Dict[str, Any] = {
-        "images": imgs,                             # (B, T_img, 3, H, W)
-        "qgrids": qgrids,                           # (B, T_q, 242) or None
-        "keypoints": kps,                           # (B, T_img, 242) or None
-        "targets": targets_flat,                    # (sum(L_i),)
-        "target_lengths": label_lengths.long(),     # (B,)
-        "qgrid_lengths": (torch.as_tensor(qgrid_lengths, dtype=torch.long)
-                          if qgrid_lengths is not None else None),  # (B,) or None
-    }
-    return batch
-# --------------------------------------------------------------------
+        # Ensure tensor types
+        if not torch.is_tensor(labels):
+            labels = torch.as_tensor(labels, dtype=torch.long)
+        if not torch.is_tensor(label_lengths):
+            label_lengths = torch.as_tensor(label_lengths, dtype=torch.long)
+
+        if shift_labels_by:
+            labels = labels + shift_labels_by
+
+        # Build flat CTC targets vector
+        parts = []
+        B = labels.size(0) if labels.ndim == 2 else 0
+        for i in range(B):
+            L = int(label_lengths[i])
+            if L > 0:
+                parts.append(labels[i, :L])
+        targets_flat = torch.cat(parts, dim=0) if parts else torch.zeros(0, dtype=torch.long)
+
+        # --------- HARD VALIDATION ---------
+        if targets_flat.numel():
+            tmin = int(targets_flat.min().item())
+            tmax = int(targets_flat.max().item())
+            if tmin < 0 or tmax >= num_classes:
+                raise RuntimeError(
+                    f"[LabelRangeError] targets min={tmin}, max={tmax}, num_classes={num_classes}. "
+                    f"shift_labels_by={shift_labels_by}, blank_idx={blank_idx}."
+                )
+            if (targets_flat == blank_idx).any().item():
+                raise RuntimeError(
+                    f"[BlankCollision] targets contain the blank index ({blank_idx}). "
+                    f"shift_labels_by={shift_labels_by}."
+                )
+        # -----------------------------------
+
+        batch: Dict[str, Any] = {
+            "images": imgs,                             # (B, T_img, 3, H, W)
+            "qgrids": qgrids,                           # (B, T_q, 242) or None
+            "keypoints": kps,                           # (B, T_img, 242) or None
+            "targets": targets_flat,                    # (sum(L_i),)
+            "target_lengths": label_lengths.long(),     # (B,)
+            "qgrid_lengths": (torch.as_tensor(qgrid_lengths, dtype=torch.long)
+                              if qgrid_lengths is not None else None),  # (B,) or None
+        }
+        return batch
+    return _collate_to_dict
+# ---------------------------------------------------------------------------- #
+
+
+class SafeCTC(torch.nn.Module):
+    """
+    Wrapper around nn.CTCLoss that asserts target ranges BEFORE CUDA kernels.
+    Works whether engine passes logits or log-probs.
+    """
+    def __init__(self, blank: int, zero_infinity: bool, num_classes: int, expect_log_probs: bool = True):
+        super().__init__()
+        self.base = torch.nn.CTCLoss(blank=blank, zero_infinity=zero_infinity)
+        self.blank = int(blank)
+        self.num_classes = int(num_classes)
+        self.expect_log_probs = expect_log_probs
+
+    def forward(self, x, targets, input_lengths, target_lengths):
+        # Support (T,B,C) or (B,T,C)
+        dims = x.dim()
+        if dims == 3 and targets.dim() == 1 and x.size(0) != input_lengths.size(0):
+            # assume (T, B, C) → transpose for checks only
+            x_bt = x.transpose(0, 1)
+        else:
+            x_bt = x
+
+        C = x_bt.size(-1)
+        if C != self.num_classes:
+            raise RuntimeError(f"[LogitsDimError] logits classes={C} but configured num_classes={self.num_classes}")
+
+        if targets.numel():
+            tmin = int(targets.min().item())
+            tmax = int(targets.max().item())
+            if tmin < 0 or tmax >= C:
+                raise RuntimeError(
+                    f"[CTC/TargetRangeError] targets min={tmin}, max={tmax}, classes(C)={C}. blank={self.blank}"
+                )
+            if (targets == self.blank).any().item():
+                raise RuntimeError(f"[CTC/BlankCollision] targets contain blank={self.blank}")
+
+        x_lp = x if self.expect_log_probs else torch.log_softmax(x, dim=-1)
+        return self.base(x_lp, targets, input_lengths, target_lengths)
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
 
     # data
-    ap.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
-    ap.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
-    ap.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
-    ap.add_argument("--meta_dir",     required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
-    ap.add_argument("--gloss_dict",   required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
-    ap.add_argument("--out_dir",      default="checkpoints/multimodal_ddp")
+    ap.add_argument("--image_prefix", required=True)
+    ap.add_argument("--qgrid_prefix", required=True)
+    ap.add_argument("--kp_path", required=True)
+    ap.add_argument("--meta_dir", required=True)       # passthrough → dataset meta_dir_path
+    ap.add_argument("--gloss_dict", required=True)     # gloss map file path
+    ap.add_argument("--out_dir", default="checkpoints/multimodal_ddp")
 
     # training
     ap.add_argument("--epochs", type=int, default=30)
@@ -98,21 +187,6 @@ def cleanup_dist():
         dist.destroy_process_group()
 
 
-def _max_target_id(ds: MultiModalPhoenixDataset) -> int:
-    m = 0
-    if hasattr(ds, "gloss_dict") and isinstance(ds.gloss_dict, dict) and len(ds.gloss_dict) > 0:
-        try:
-            m = max(int(v) for v in ds.gloss_dict.values())
-        except Exception:
-            pass
-    if hasattr(ds, "id_to_gloss") and isinstance(ds.id_to_gloss, dict) and len(ds.id_to_gloss) > 0:
-        try:
-            m = max(m, max(int(k) for k in ds.id_to_gloss.keys()))
-        except Exception:
-            pass
-    return int(m)
-
-
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -126,7 +200,18 @@ def main():
     base_seed = 1337
     torch.manual_seed(base_seed + (dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0))
 
-    # ---- datasets (pass correct kwarg names) ----
+    # ----------------------- PREFLIGHT: LABEL ID SPACE ----------------------- #
+    min_id, max_id = _compute_id_bounds_from_map(args.gloss_dict)
+    # If 0 is a real label id, shift +1 so 0 is reserved for blank.
+    shift_labels_by = 1 if min_id == 0 else 0
+    num_classes = int(max_id + 1 + shift_labels_by)
+    blank_idx = 0
+    if _is_main():
+        print(f"[preflight] gloss_id_range=[{min_id}, {max_id}]  "
+              f"shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}")
+    # ------------------------------------------------------------------------ #
+
+    # ---- datasets ----
     train_ds = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
@@ -144,12 +229,6 @@ def main():
         split="dev",
     )
 
-    # Compute robust num_classes from actual max id (handles non-contiguous id spaces)
-    max_id = _max_target_id(train_ds)
-    num_classes = int(max_id) + 1  # class ids are in [0, max_id]; output dim = max_id+1
-    if _is_main():
-        print(f"[setup] max_label_id(train)={max_id} → num_classes={num_classes} (CTC blank=0)")
-
     # samplers
     if dist.is_available() and dist.is_initialized():
         train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=False)
@@ -158,7 +237,8 @@ def main():
         train_sampler = None
         val_sampler = None
 
-    # dataloaders
+    # dataloaders with deterministic collate + validation
+    collate_fn = make_collate_to_dict(shift_labels_by=shift_labels_by, blank_idx=blank_idx, num_classes=num_classes)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -167,7 +247,7 @@ def main():
         shuffle=(train_sampler is None),
         pin_memory=True,
         drop_last=False,
-        collate_fn=_collate_to_dict,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -177,7 +257,7 @@ def main():
         shuffle=False,
         pin_memory=True,
         drop_last=False,
-        collate_fn=_collate_to_dict,
+        collate_fn=collate_fn,
     )
 
     # ---- model ----
@@ -198,7 +278,7 @@ def main():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     # ---- loss/opt/amp ----
-    criterion = torch.nn.CTCLoss(blank=0, zero_infinity=True)  # keep blank=0 to match your eval
+    criterion = SafeCTC(blank=blank_idx, zero_infinity=True, num_classes=num_classes, expect_log_probs=True)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(device="cuda", enabled=not args.bf16)
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -230,7 +310,13 @@ def main():
                 "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
                 "optim": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
-                "args": vars(args),
+                "args": {
+                    **vars(args),
+                    "num_classes": num_classes,
+                    "shift_labels_by": shift_labels_by,
+                    "blank_idx": blank_idx,
+                    "gloss_id_range": (int(min_id), int(max_id)),
+                },
             }
             torch.save(ckpt, os.path.join(args.out_dir, f"epoch_{epoch:03d}.pth"))
 
@@ -245,7 +331,13 @@ def main():
                     "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
                     "optim": optimizer.state_dict(),
                     "scaler": scaler.state_dict(),
-                    "args": vars(args),
+                    "args": {
+                        **vars(args),
+                        "num_classes": num_classes,
+                        "shift_labels_by": shift_labels_by,
+                        "blank_idx": blank_idx,
+                        "gloss_id_range": (int(min_id), int(max_id)),
+                    },
                 }
                 torch.save(ckpt_best, os.path.join(args.out_dir, "best.pth"))
             print(f"[epoch {epoch}] train_loss={stats['loss']:.4f}  skipped={stats['skipped']}  "
@@ -259,6 +351,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
