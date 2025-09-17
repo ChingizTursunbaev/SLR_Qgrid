@@ -54,12 +54,12 @@ def parse_args():
     ap = argparse.ArgumentParser()
 
     # data
-    ap.add_argument("--image_prefix", required=True)
-    ap.add_argument("--qgrid_prefix", required=True)
-    ap.add_argument("--kp_path", required=True)
-    ap.add_argument("--meta_dir", required=True)       # will be passed to dataset as meta_dir_path
-    ap.add_argument("--gloss_dict", required=True)     # will be passed to dataset as gloss_dict_path
-    ap.add_argument("--out_dir", default="checkpoints/multimodal_ddp")
+    ap.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
+    ap.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
+    ap.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
+    ap.add_argument("--meta_dir",     required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
+    ap.add_argument("--gloss_dict",   required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
+    ap.add_argument("--out_dir",      default="checkpoints/multimodal_ddp")
 
     # training
     ap.add_argument("--epochs", type=int, default=30)
