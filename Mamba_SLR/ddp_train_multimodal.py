@@ -97,14 +97,16 @@ def main():
     gloss_dict_path=args.gloss_dict,     # <-- renamed kwarg
     split="train",
     transforms=None,
-)
+    )
+    
     val_ds = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
         kp_path=args.kp_path,
-        meta_dir=args.meta_dir,
-        split="dev",
+        meta_dir_path=args.meta_dir,
         gloss_dict_path=args.gloss_dict,
+        split="dev",
+        transforms=None,
     )
 
     if dist.is_available() and dist.is_initialized():
