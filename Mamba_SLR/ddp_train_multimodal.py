@@ -47,30 +47,45 @@ def make_collate_to_dict(shift_labels_by: int, blank_idx: int, num_classes: int)
     Wrap repo collate to:
       - optionally shift labels to avoid blank collision,
       - build flat CTC targets,
-      - VALIDATE every batch: targets in [0, num_classes-1] and targets != blank_idx.
+      - VALIDATE targets every batch,
+      - ***CLAMP variable-length metadata*** to the true time dims to prevent gather OOB.
     """
     def _collate_to_dict(samples):
         imgs, qgrids, kps, labels, image_lengths, label_lengths, qgrid_lengths = multi_modal_collate_fn(samples)
 
-        # Ensure tensor types
+        # ---- types ----
         if not torch.is_tensor(labels):
             labels = torch.as_tensor(labels, dtype=torch.long)
         if not torch.is_tensor(label_lengths):
             label_lengths = torch.as_tensor(label_lengths, dtype=torch.long)
+        if not torch.is_tensor(image_lengths):
+            image_lengths = torch.as_tensor(image_lengths, dtype=torch.long)
+        if qgrid_lengths is not None and not torch.is_tensor(qgrid_lengths):
+            qgrid_lengths = torch.as_tensor(qgrid_lengths, dtype=torch.long)
 
+        # ---- clamp lengths to actual T ----
+        if imgs is not None and imgs.ndim >= 2:
+            T_img = int(imgs.size(1))
+            image_lengths = image_lengths.clamp(min=1, max=T_img)
+        if qgrids is not None and qgrids.ndim >= 2 and qgrid_lengths is not None:
+            T_q = int(qgrids.size(1))
+            qgrid_lengths = qgrid_lengths.clamp(min=1, max=T_q)
+
+        # ---- optional label shift ----
         if shift_labels_by:
             labels = labels + shift_labels_by
 
-        # Build flat CTC targets vector
+        # ---- build flat CTC targets ----
         parts = []
-        B = labels.size(0) if labels.ndim == 2 else 0
-        for i in range(B):
-            L = int(label_lengths[i])
-            if L > 0:
-                parts.append(labels[i, :L])
+        if labels.ndim == 2:
+            B = labels.size(0)
+            for i in range(B):
+                L = int(label_lengths[i])
+                if L > 0:
+                    parts.append(labels[i, :L])
         targets_flat = torch.cat(parts, dim=0) if parts else torch.zeros(0, dtype=torch.long)
 
-        # --------- HARD VALIDATION ---------
+        # ---- HARD VALIDATION (targets) ----
         if targets_flat.numel():
             tmin = int(targets_flat.min().item())
             tmax = int(targets_flat.max().item())
@@ -84,16 +99,17 @@ def make_collate_to_dict(shift_labels_by: int, blank_idx: int, num_classes: int)
                     f"[BlankCollision] targets contain the blank index ({blank_idx}). "
                     f"shift_labels_by={shift_labels_by}."
                 )
-        # -----------------------------------
 
+        # ready
         batch: Dict[str, Any] = {
             "images": imgs,                             # (B, T_img, 3, H, W)
             "qgrids": qgrids,                           # (B, T_q, 242) or None
             "keypoints": kps,                           # (B, T_img, 242) or None
             "targets": targets_flat,                    # (sum(L_i),)
             "target_lengths": label_lengths.long(),     # (B,)
-            "qgrid_lengths": (torch.as_tensor(qgrid_lengths, dtype=torch.long)
-                              if qgrid_lengths is not None else None),  # (B,) or None
+            "qgrid_lengths": (qgrid_lengths.long() if qgrid_lengths is not None else None),  # (B,) or None
+            # Keep image_lengths in case your model uses it
+            "image_lengths": image_lengths.long(),      # (B,)
         }
         return batch
     return _collate_to_dict
@@ -114,17 +130,10 @@ class SafeCTC(torch.nn.Module):
 
     def forward(self, x, targets, input_lengths, target_lengths):
         # Support (T,B,C) or (B,T,C)
-        dims = x.dim()
-        if dims == 3 and targets.dim() == 1 and x.size(0) != input_lengths.size(0):
-            # assume (T, B, C) → transpose for checks only
-            x_bt = x.transpose(0, 1)
-        else:
-            x_bt = x
-
+        x_bt = x.transpose(0, 1) if (x.dim() == 3 and x.size(0) != input_lengths.size(0)) else x
         C = x_bt.size(-1)
         if C != self.num_classes:
             raise RuntimeError(f"[LogitsDimError] logits classes={C} but configured num_classes={self.num_classes}")
-
         if targets.numel():
             tmin = int(targets.min().item())
             tmax = int(targets.max().item())
@@ -134,7 +143,6 @@ class SafeCTC(torch.nn.Module):
                 )
             if (targets == self.blank).any().item():
                 raise RuntimeError(f"[CTC/BlankCollision] targets contain blank={self.blank}")
-
         x_lp = x if self.expect_log_probs else torch.log_softmax(x, dim=-1)
         return self.base(x_lp, targets, input_lengths, target_lengths)
 
@@ -202,14 +210,12 @@ def main():
 
     # ----------------------- PREFLIGHT: LABEL ID SPACE ----------------------- #
     min_id, max_id = _compute_id_bounds_from_map(args.gloss_dict)
-    # If 0 is a real label id, shift +1 so 0 is reserved for blank.
     shift_labels_by = 1 if min_id == 0 else 0
     num_classes = int(max_id + 1 + shift_labels_by)
     blank_idx = 0
     if _is_main():
         print(f"[preflight] gloss_id_range=[{min_id}, {max_id}]  "
               f"shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}")
-    # ------------------------------------------------------------------------ #
 
     # ---- datasets ----
     train_ds = MultiModalPhoenixDataset(
@@ -237,7 +243,7 @@ def main():
         train_sampler = None
         val_sampler = None
 
-    # dataloaders with deterministic collate + validation
+    # dataloaders with deterministic collate + validation + clamping
     collate_fn = make_collate_to_dict(shift_labels_by=shift_labels_by, blank_idx=blank_idx, num_classes=num_classes)
     train_loader = DataLoader(
         train_ds,
@@ -351,6 +357,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
