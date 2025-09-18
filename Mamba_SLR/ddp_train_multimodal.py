@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # ddp_train_multimodal.py
 # Distributed training for MultiModal Mamba SLR with gradient accumulation + BF16 (optional).
-# Includes a pre-DDP dummy forward pass to materialize lazy params.
+# Includes a pre-DDP dummy forward that robustly materializes lazy params even if the
+# frame encoder expects 4D (B,C,H,W) while batch images are 5D (B,T,C,H,W).
 
 import os
 import argparse
@@ -67,7 +68,6 @@ def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torc
     for t in cands:
         if t is None or t.dim() != 1:
             continue
-        # Heuristic: lengths must be <= target dimension
         if int(t.max().item()) <= target_dim:
             return t
     return None
@@ -75,7 +75,7 @@ def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torc
 
 def unpack_batch(batch: Any) -> Dict[str, Any]:
     """
-    Collate in repo returns a tuple; infer fields by shapes:
+    Collate returns a tuple; infer fields by shapes:
       - images: (B,T,C,H,W) float
       - qgrids/keypoints: (B,T,D) float
       - labels: (B,Lmax) long
@@ -116,7 +116,6 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
     qgrid_lengths = find_1d_lengths(one_d, T_q or 10**9)
     label_lengths = find_1d_lengths(one_d, L_lab or 10**9)
 
-    # Fallback lengths if missing
     dev = (imgs.device if imgs is not None else (labels.device if labels is not None else torch.device("cpu")))
     if image_lengths is None and T_img is not None:
         image_lengths = torch.full((B,), T_img, dtype=torch.long, device=dev)
@@ -174,7 +173,8 @@ def materialize_params_with_dummy_forward(model: nn.Module,
                                           use_bf16: bool):
     """
     Run one forward pass on a real batch to force-shape any lazy submodules
-    before wrapping with DDP. Safe on every rank.
+    before wrapping with DDP. If the model's frame encoder expects 4D input,
+    we prime it with a single frame (B, C, H, W) and then retry the normal forward.
     """
     model.eval()
     try:
@@ -189,11 +189,41 @@ def materialize_params_with_dummy_forward(model: nn.Module,
     keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
     qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
 
-    if use_bf16:
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    def _forward():
+        if use_bf16:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _ = model(images, qgrids, keypoints, qgrid_lengths)
+        else:
             _ = model(images, qgrids, keypoints, qgrid_lengths)
-    else:
-        _ = model(images, qgrids, keypoints, qgrid_lengths)
+
+    try:
+        _forward()
+    except Exception as e:
+        msg = str(e)
+        # If the frame encoder demanded 4D (B,C,H,W) but we passed 5D (B,T,C,H,W),
+        # initialize it with the first frame and retry.
+        primed = False
+        if images is not None and images.dim() == 5 and hasattr(model, "frame_encoder") and (
+            "too many values to unpack" in msg
+            or "expected 4" in msg
+            or "got 5" in msg
+        ):
+            try:
+                # Take the first time step -> (B, C, H, W)
+                img4 = images[:, 0, ...]
+                _ = model.frame_encoder(img4)
+                primed = True
+                if is_main_process():
+                    print("[ddp] primed frame_encoder with (B,C,H,W) single-frame input.", flush=True)
+            except Exception as e2:
+                if is_main_process():
+                    print(f"[ddp] frame_encoder priming failed: {e2}", flush=True)
+
+        if primed:
+            _forward()  # retry after priming
+        else:
+            # If we couldn't prime, surface the original error.
+            raise
 
     torch.cuda.synchronize(device)
     model.train()
@@ -260,7 +290,6 @@ def train(args):
 
     # precision
     use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if use_bf16 else None
     if is_main_process():
         preflight_print(args.gloss_dict, shift_labels_by=0, num_classes=args.num_classes, blank_idx=0)
         if args.bf16 and not use_bf16:
@@ -300,7 +329,7 @@ def train(args):
             labels = batch["labels"].to(device, non_blocking=True)
 
             if use_bf16:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
                     log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T,B,V)
             else:
@@ -347,7 +376,7 @@ def train(args):
                 labels = batch["labels"].to(device, non_blocking=True)
 
                 if use_bf16:
-                    with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits = model(images, qgrids, keypoints, qgrid_lengths)
                         log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
                 else:
@@ -390,7 +419,7 @@ def train(args):
 def get_args():
     p = argparse.ArgumentParser()
 
-    # data (defaults from your note)
+    # data (your defaults)
     p.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
     p.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
     p.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
@@ -425,6 +454,7 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     train(args)
+
 
 
 
