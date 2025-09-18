@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 # ddp_train_multimodal.py
-# Distributed training for MultiModal Mamba SLR with gradient accumulation + BF16 (optional).
-# Includes a pre-DDP dummy forward that robustly materializes lazy params even if the
-# frame encoder expects 4D (B,C,H,W) while batch images are 5D (B,T,C,H,W).
+# DDP trainer with robust dummy materialization and a runtime adapter that lets
+# a 4D frame encoder consume 5D (B,T,C,H,W) video batches safely.
 
 import os
 import argparse
@@ -14,17 +13,17 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-# --- dataset import (repo layout) ---
+# --- dataset import (repo layout variations) ---
 try:
     from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
 except Exception:
-    from slr.data.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn  # type: ignore
+    from slr.data.multi_modal_multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn  # fallback if layout differs
 
 # --- model ---
 from slr.models.multi_modal_model import MultiModalMamba
 
 
-def is_main_process() -> bool:
+def is_main() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
 
@@ -46,22 +45,23 @@ def cleanup_ddp():
 
 
 def preflight_print(gloss_path: str, shift_labels_by: int, num_classes: int, blank_idx: int):
-    if is_main_process():
-        try:
-            import numpy as np
-            arr = np.load(gloss_path, allow_pickle=True)
-            if hasattr(arr, "item"):
-                try:
-                    d = arr.item()
-                    ids = list(d.values())
-                except Exception:
-                    ids = [int(v) for v in arr.ravel()]
-            else:
+    if not is_main():
+        return
+    try:
+        import numpy as np
+        arr = np.load(gloss_path, allow_pickle=True)
+        if hasattr(arr, "item"):
+            try:
+                d = arr.item()
+                ids = list(d.values())
+            except Exception:
                 ids = [int(v) for v in arr.ravel()]
-            gmin, gmax = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
-        except Exception:
-            gmin, gmax = (1, num_classes - 1)
-        print(f"[preflight] gloss_id_range=[{gmin}, {gmax}]  shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}", flush=True)
+        else:
+            ids = [int(v) for v in arr.ravel()]
+        gmin, gmax = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
+    except Exception:
+        gmin, gmax = (1, num_classes - 1)
+    print(f"[preflight] gloss_id_range=[{gmin}, {gmax}]  shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}", flush=True)
 
 
 def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torch.Tensor]:
@@ -75,7 +75,7 @@ def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torc
 
 def unpack_batch(batch: Any) -> Dict[str, Any]:
     """
-    Collate returns a tuple; infer fields by shapes:
+    The collate returns a tuple. Infer fields by shapes:
       - images: (B,T,C,H,W) float
       - qgrids/keypoints: (B,T,D) float
       - labels: (B,Lmax) long
@@ -112,11 +112,11 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
     T_q = qg.size(1) if qg is not None else None
     L_lab = labels.size(1) if labels is not None else None
 
+    dev = (imgs.device if imgs is not None else (labels.device if labels is not None else torch.device("cpu")))
     image_lengths = find_1d_lengths(one_d, T_img or 10**9)
     qgrid_lengths = find_1d_lengths(one_d, T_q or 10**9)
     label_lengths = find_1d_lengths(one_d, L_lab or 10**9)
 
-    dev = (imgs.device if imgs is not None else (labels.device if labels is not None else torch.device("cpu")))
     if image_lengths is None and T_img is not None:
         image_lengths = torch.full((B,), T_img, dtype=torch.long, device=dev)
     if qgrid_lengths is None and T_q is not None:
@@ -162,8 +162,52 @@ def save_ckpt(state: Dict, out_dir: str, name: str):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
     torch.save(state, path)
-    if is_main_process():
+    if is_main():
         print(f"[ckpt] saved -> {path}", flush=True)
+
+
+def wrap_frame_encoder_for_5d(model: nn.Module):
+    """
+    If model.frame_encoder expects 4D (B_T,C,H,W), wrap it so it can take 5D (B,T,C,H,W).
+    We reshape to 4D, call the original, then reshape back to (B,T,*) or mean-pool if needed.
+    """
+    if not hasattr(model, "frame_encoder"):
+        return
+
+    fe = model.frame_encoder
+    if not hasattr(fe, "forward"):
+        return
+
+    orig_forward = fe.forward
+
+    def adapter(x: torch.Tensor, *args, **kwargs):
+        # If already 4D, just pass through.
+        if x.dim() == 4:
+            return orig_forward(x, *args, **kwargs)
+
+        # If 5D video batch: (B,T,C,H,W) -> (B*T,C,H,W)
+        if x.dim() == 5:
+            B, T, C, H, W = x.shape
+            x4 = x.reshape(B * T, C, H, W)
+            y = orig_forward(x4, *args, **kwargs)
+
+            # y can be (B*T, D) or (B*T, S, D). Return (B,T,D).
+            if y.dim() == 2:
+                D = y.size(-1)
+                return y.view(B, T, D)
+            elif y.dim() == 3:
+                # (B*T, S, D) -> pool S, return (B,T,D)
+                y = y.mean(dim=1)
+                D = y.size(-1)
+                return y.view(B, T, D)
+            else:
+                raise RuntimeError(f"Unsupported frame_encoder output shape {tuple(y.shape)}")
+
+        raise RuntimeError(f"frame_encoder received tensor with shape {tuple(x.shape)} (expected 4D or 5D)")
+
+    fe.forward = adapter
+    if is_main():
+        print("[adapter] Wrapped frame_encoder to accept 5D (B,T,C,H,W) and return (B,T,D).", flush=True)
 
 
 @torch.no_grad()
@@ -171,11 +215,7 @@ def materialize_params_with_dummy_forward(model: nn.Module,
                                           loader: DataLoader,
                                           device: torch.device,
                                           use_bf16: bool):
-    """
-    Run one forward pass on a real batch to force-shape any lazy submodules
-    before wrapping with DDP. If the model's frame encoder expects 4D input,
-    we prime it with a single frame (B, C, H, W) and then retry the normal forward.
-    """
+    """Run one real batch forward to initialize all lazy params before DDP."""
     model.eval()
     try:
         data_iter = iter(loader)
@@ -189,45 +229,15 @@ def materialize_params_with_dummy_forward(model: nn.Module,
     keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
     qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
 
-    def _forward():
-        if use_bf16:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _ = model(images, qgrids, keypoints, qgrid_lengths)
-        else:
+    if use_bf16:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             _ = model(images, qgrids, keypoints, qgrid_lengths)
-
-    try:
-        _forward()
-    except Exception as e:
-        msg = str(e)
-        # If the frame encoder demanded 4D (B,C,H,W) but we passed 5D (B,T,C,H,W),
-        # initialize it with the first frame and retry.
-        primed = False
-        if images is not None and images.dim() == 5 and hasattr(model, "frame_encoder") and (
-            "too many values to unpack" in msg
-            or "expected 4" in msg
-            or "got 5" in msg
-        ):
-            try:
-                # Take the first time step -> (B, C, H, W)
-                img4 = images[:, 0, ...]
-                _ = model.frame_encoder(img4)
-                primed = True
-                if is_main_process():
-                    print("[ddp] primed frame_encoder with (B,C,H,W) single-frame input.", flush=True)
-            except Exception as e2:
-                if is_main_process():
-                    print(f"[ddp] frame_encoder priming failed: {e2}", flush=True)
-
-        if primed:
-            _forward()  # retry after priming
-        else:
-            # If we couldn't prime, surface the original error.
-            raise
+    else:
+        _ = model(images, qgrids, keypoints, qgrid_lengths)
 
     torch.cuda.synchronize(device)
     model.train()
-    if is_main_process():
+    if is_main():
         print("[ddp] dummy forward ran; parameters materialized.", flush=True)
 
 
@@ -288,17 +298,20 @@ def train(args):
         pool_mode=args.pool_mode,
     ).to(device)
 
+    # **CRITICAL**: wrap frame_encoder so it can consume (B,T,C,H,W)
+    wrap_frame_encoder_for_5d(model)
+
     # precision
     use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    if is_main_process():
+    if is_main():
         preflight_print(args.gloss_dict, shift_labels_by=0, num_classes=args.num_classes, blank_idx=0)
         if args.bf16 and not use_bf16:
             print("[warn] --bf16 requested but not supported; training in fp32.", flush=True)
 
-    # >>> run one dummy forward to materialize lazy params BEFORE DDP <<<
+    # >>> materialize BEFORE DDP <<<
     materialize_params_with_dummy_forward(model, train_loader, device, use_bf16)
 
-    # now wrap with DDP
+    # wrap with DDP
     if torch.distributed.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
@@ -341,7 +354,7 @@ def train(args):
 
             targets = flatten_targets(labels, label_lengths)
             if not valid_ctc_targets(targets, args.num_classes, blank_idx):
-                if is_main_process():
+                if is_main():
                     tmin = int(targets.min().item()) if targets.numel() else -1
                     tmax = int(targets.max().item()) if targets.numel() else -1
                     print(f"[skip-batch] invalid targets (min={tmin}, max={tmax}, V={args.num_classes}); step={global_step} epoch={epoch} it={it}", flush=True)
@@ -358,7 +371,7 @@ def train(args):
             seen += B
             global_step += 1
 
-            if is_main_process() and (it % args.log_interval == 0):
+            if is_main() and (it % args.log_interval == 0):
                 print(f"Epoch: [{epoch}]  [{it}/{len(train_loader)}]  lr: {args.lr:.6f}  loss: {running/max(1,seen):.4f}  accum:{accum}", flush=True)
 
         # ---- validation ----
@@ -392,7 +405,7 @@ def train(args):
                 val_loss += float(loss.item()) * B
                 val_seen += B
 
-        if is_main_process():
+        if is_main():
             avg_train = running / max(1, seen)
             avg_val = val_loss / max(1, val_seen)
             print(f"[epoch {epoch}] train_loss={avg_train:.4f}  val_loss={avg_val:.4f}  (accum={accum})", flush=True)
@@ -454,6 +467,7 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     train(args)
+
 
 
 
