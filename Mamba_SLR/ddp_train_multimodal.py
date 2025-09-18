@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 # ---- Project imports ----
-from slr.data.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
+from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
 from slr.models.multi_modal_model import MultiModalMamba
 
 
