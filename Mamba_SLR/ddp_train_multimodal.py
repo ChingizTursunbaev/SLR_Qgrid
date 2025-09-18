@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # ddp_train_multimodal.py
 # Distributed training for MultiModal Mamba SLR with gradient accumulation + BF16 (optional).
+# Includes a pre-DDP dummy forward pass to materialize lazy params.
 
 import os
 import argparse
@@ -12,11 +13,10 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-# --- dataset import (your repo layout) ---
+# --- dataset import (repo layout) ---
 try:
     from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
 except Exception:
-    # fallback if older path
     from slr.data.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn  # type: ignore
 
 # --- model ---
@@ -49,12 +49,15 @@ def preflight_print(gloss_path: str, shift_labels_by: int, num_classes: int, bla
         try:
             import numpy as np
             arr = np.load(gloss_path, allow_pickle=True)
-            if isinstance(arr.item(), dict):
-                ids = list(arr.item().values())
-                gmin, gmax = min(ids), max(ids)
+            if hasattr(arr, "item"):
+                try:
+                    d = arr.item()
+                    ids = list(d.values())
+                except Exception:
+                    ids = [int(v) for v in arr.ravel()]
             else:
-                ids = [int(v) for v in arr.ravel() if isinstance(v, (int, np.integer))]
-                gmin, gmax = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
+                ids = [int(v) for v in arr.ravel()]
+            gmin, gmax = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
         except Exception:
             gmin, gmax = (1, num_classes - 1)
         print(f"[preflight] gloss_id_range=[{gmin}, {gmax}]  shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}", flush=True)
@@ -64,6 +67,7 @@ def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torc
     for t in cands:
         if t is None or t.dim() != 1:
             continue
+        # Heuristic: lengths must be <= target dimension
         if int(t.max().item()) <= target_dim:
             return t
     return None
@@ -71,7 +75,7 @@ def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torc
 
 def unpack_batch(batch: Any) -> Dict[str, Any]:
     """
-    Your collate returns a tuple. We infer by shapes to avoid key assumptions:
+    Collate in repo returns a tuple; infer fields by shapes:
       - images: (B,T,C,H,W) float
       - qgrids/keypoints: (B,T,D) float
       - labels: (B,Lmax) long
@@ -112,13 +116,20 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
     qgrid_lengths = find_1d_lengths(one_d, T_q or 10**9)
     label_lengths = find_1d_lengths(one_d, L_lab or 10**9)
 
+    # Fallback lengths if missing
+    dev = (imgs.device if imgs is not None else (labels.device if labels is not None else torch.device("cpu")))
+    if image_lengths is None and T_img is not None:
+        image_lengths = torch.full((B,), T_img, dtype=torch.long, device=dev)
+    if qgrid_lengths is None and T_q is not None:
+        qgrid_lengths = torch.full((B,), T_q, dtype=torch.long, device=dev)
+    if label_lengths is None and L_lab is not None:
+        label_lengths = torch.full((B,), L_lab, dtype=torch.long, device=dev)
+
     return {
         "images": imgs,
         "qgrids": qg,
         "keypoints": kp,
-        "image_lengths": image_lengths if image_lengths is not None else (
-            torch.full((B,), T_img or 1, dtype=torch.long, device=imgs.device if imgs is not None else labels.device)
-        ),
+        "image_lengths": image_lengths,
         "qgrid_lengths": qgrid_lengths,
         "labels": labels,
         "label_lengths": label_lengths,
@@ -154,6 +165,40 @@ def save_ckpt(state: Dict, out_dir: str, name: str):
     torch.save(state, path)
     if is_main_process():
         print(f"[ckpt] saved -> {path}", flush=True)
+
+
+@torch.no_grad()
+def materialize_params_with_dummy_forward(model: nn.Module,
+                                          loader: DataLoader,
+                                          device: torch.device,
+                                          use_bf16: bool):
+    """
+    Run one forward pass on a real batch to force-shape any lazy submodules
+    before wrapping with DDP. Safe on every rank.
+    """
+    model.eval()
+    try:
+        data_iter = iter(loader)
+        batch = next(data_iter)
+    except StopIteration:
+        return
+
+    batch = unpack_batch(batch)
+    images = batch["images"].to(device, non_blocking=True) if batch["images"] is not None else None
+    qgrids = batch["qgrids"].to(device, non_blocking=True) if batch["qgrids"] is not None else None
+    keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
+    qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
+
+    if use_bf16:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _ = model(images, qgrids, keypoints, qgrid_lengths)
+    else:
+        _ = model(images, qgrids, keypoints, qgrid_lengths)
+
+    torch.cuda.synchronize(device)
+    model.train()
+    if is_main_process():
+        print("[ddp] dummy forward ran; parameters materialized.", flush=True)
 
 
 def train(args):
@@ -213,20 +258,24 @@ def train(args):
         pool_mode=args.pool_mode,
     ).to(device)
 
+    # precision
+    use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else None
+    if is_main_process():
+        preflight_print(args.gloss_dict, shift_labels_by=0, num_classes=args.num_classes, blank_idx=0)
+        if args.bf16 and not use_bf16:
+            print("[warn] --bf16 requested but not supported; training in fp32.", flush=True)
+
+    # >>> run one dummy forward to materialize lazy params BEFORE DDP <<<
+    materialize_params_with_dummy_forward(model, train_loader, device, use_bf16)
+
+    # now wrap with DDP
     if torch.distributed.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     blank_idx = 0
     ctc_loss = nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    # precision
-    use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if use_bf16 else None
-    if is_main_process():
-        preflight_print(args.gloss_dict, shift_labels_by=0, num_classes=args.num_classes, blank_idx=blank_idx)
-        if args.bf16 and not use_bf16:
-            print("[warn] --bf16 requested but not supported; training in fp32.", flush=True)
 
     accum = max(1, int(args.accum))
     global_step = 0
@@ -272,7 +321,6 @@ def train(args):
             loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
             (loss / accum).backward()
 
-            # step on accumulation boundary or at the very end
             if (global_step + 1) % accum == 0 or (it + 1) == len(train_loader):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -377,6 +425,7 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     train(args)
+
 
 
 
