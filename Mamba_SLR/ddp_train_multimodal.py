@@ -1,311 +1,151 @@
-
-
-# ddp_train_multimodal.py (patched for robust label/length validation & safe CTC)
+#!/usr/bin/env python
+# ddp_train_multimodal.py
+# Distributed training entrypoint for MultiModal Mamba SLR with length-safe model + optional BF16.
 import os
-os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")  # surface exact kernel sites
-
-import time
 import argparse
-from typing import Dict, Any, Tuple, List
+from typing import Any, Dict, List, Optional
 
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import optim
-from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
+# ---- Project imports ----
+from slr.data.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
 from slr.models.multi_modal_model import MultiModalMamba
 
-# ---------------- util ----------------
-def _is_main() -> bool:
-    return (not dist.is_available()) or (not dist.is_initialized()) or (dist.get_rank() == 0)
 
-def _setup_dist() -> None:
+def is_main_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-
-def _cleanup_dist() -> None:
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-
-# ---------------- dataset/labels helpers ----------------
-def _compute_id_bounds_from_map(npy_path: str) -> Tuple[int, int]:
-    d = torch.load(npy_path, map_location="cpu") if npy_path.endswith(".pt") else None
-    if d is None:
-        import numpy as np
-        arr = np.load(npy_path, allow_pickle=True).item()
-        ids = []
-        for v in arr.values():
-            if isinstance(v, (list, tuple)):
-                ids.append(int(v[0]))
-            else:
-                ids.append(int(v))
-        return (min(ids), max(ids))
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        return device, local_rank
     else:
-        ids = [int(v[0] if isinstance(v, (list, tuple)) else v) for v in d.values()]
-        return (min(ids), max(ids))
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return device, 0
 
-def make_collate_to_dict(shift_labels_by: int, blank_idx: int, num_classes: int):
-    """
-    Wrap repo collate to:
-      - optionally shift labels to avoid blank collision,
-      - build flat CTC targets,
-      - VALIDATE targets every batch,
-      - ***CLAMP variable-length metadata*** to the true time dims to prevent gather OOB.
-    """
-    def _collate_to_dict(samples):
-        imgs, qgrids, kps, labels, image_lengths, label_lengths, qgrid_lengths = multi_modal_collate_fn(samples)
 
-        # ---- types ----
-        if not torch.is_tensor(labels):
-            labels = torch.as_tensor(labels, dtype=torch.long)
-        if not torch.is_tensor(label_lengths):
-            label_lengths = torch.as_tensor(label_lengths, dtype=torch.long)
-        if not torch.is_tensor(image_lengths):
-            image_lengths = torch.as_tensor(image_lengths, dtype=torch.long)
-        if qgrid_lengths is not None and not torch.is_tensor(qgrid_lengths):
-            qgrid_lengths = torch.as_tensor(qgrid_lengths, dtype=torch.long)
+def cleanup_ddp():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
-        # ---- clamp lengths to actual T ----
-        if imgs is not None and imgs.ndim >= 2:
-            T_img = int(imgs.size(1))
-            image_lengths = image_lengths.clamp(min=1, max=T_img)
-        if qgrids is not None and qgrids.ndim >= 2 and qgrid_lengths is not None:
-            T_q = int(qgrids.size(1))
-            qgrid_lengths = qgrid_lengths.clamp(min=1, max=T_q)
 
-        # ---- optional label shift ----
-        if shift_labels_by:
-            labels = labels + shift_labels_by
-
-        # ---- build flat CTC targets ----
-        parts = []
-        if labels.ndim == 2:
-            B = labels.size(0)
-            for i in range(B):
-                L = int(label_lengths[i])
-                if L > 0:
-                    parts.append(labels[i, :L])
-        targets_flat = torch.cat(parts, dim=0) if parts else torch.zeros(0, dtype=torch.long)
-
-        # ---- HARD VALIDATION (targets) ----
-        if targets_flat.numel():
-            tmin = int(targets_flat.min().item())
-            tmax = int(targets_flat.max().item())
-            if tmin < 0 or tmax >= num_classes:
-                raise RuntimeError(
-                    f"[LabelRangeError] targets min={tmin}, max={tmax}, num_classes={num_classes}. "
-                    f"shift_labels_by={shift_labels_by}, blank_idx={blank_idx}."
-                )
-            if (targets_flat == blank_idx).any().item():
-                raise RuntimeError(
-                    f"[BlankCollision] targets contain the blank index ({blank_idx}). "
-                    f"shift_labels_by={shift_labels_by}."
-                )
-
-        return {
-            "images": imgs, "qgrids": qgrids, "keypoints": kps,
-            "targets": targets_flat,
-            "image_lengths": image_lengths, "target_lengths": label_lengths,
-            "qgrid_lengths": qgrid_lengths,
-        }
-    return _collate_to_dict
-
-# ------------------ Validated CTC ------------------
-class ValidatedCTC(torch.nn.Module):
-    """
-    Wrapper around nn.CTCLoss that asserts target ranges BEFORE CUDA kernels.
-    Also checks logits dimensions.
-    """
-    def __init__(self, blank: int, num_classes: int, expect_log_probs: bool = True):
-        super().__init__()
-        self.blank = blank
-        self.num_classes = num_classes
-        self.expect_log_probs = expect_log_probs
-        self.base = torch.nn.CTCLoss(blank=blank, zero_infinity=True, reduction="mean")
-
-    def forward(self, x, targets, input_lengths, target_lengths):
-        # x: (T,B,C) or (B,T,C) depending on caller; engine will pass (T,B,C)
-        if x.dim() == 3 and x.shape[0] < x.shape[1]:  # (B,T,C) -> (T,B,C)
-            x = x.transpose(0, 1)
-        T, B, C = x.shape
-        if C != self.num_classes:
-            raise RuntimeError(f"[LogitsDimError] logits classes={C} but configured num_classes={self.num_classes}")
-        if targets.numel():
-            tmin = int(targets.min().item())
-            tmax = int(targets.max().item())
-            if tmin < 0 or tmax >= C:
-                raise RuntimeError(
-                    f"[CTC/TargetRangeError] targets min={tmin}, max={tmax}, classes(C)={C}. blank={self.blank}"
-                )
-            if (targets == self.blank).any().item():
-                raise RuntimeError(f"[CTC/BlankCollision] targets contain blank={self.blank}")
-        x_lp = x if self.expect_log_probs else torch.log_softmax(x, dim=-1)
-        return self.base(x_lp, targets, input_lengths, target_lengths)
-
-# ---------------- training & eval ----------------
-def _move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
-    out = {}
-    for k, v in batch.items():
-        if torch.is_tensor(v):
-            out[k] = v.to(device, non_blocking=True)
-        else:
-            out[k] = v
-    return out
-
-def _ctc_input_lengths(log_probs: torch.Tensor) -> torch.Tensor:
-    # log_probs: (B, T, V)
-    B, T, _ = log_probs.shape
-    return torch.full((B,), T, dtype=torch.long, device=log_probs.device)
-
-@torch.no_grad()
-def _greedy_decode_ctc(log_probs: torch.Tensor) -> List[List[int]]:
-    # log_probs: (B, T, V)
-    pred = log_probs.argmax(dim=-1)  # (B,T)
-    B, T = pred.shape
-    hyps: List[List[int]] = []
-    for b in range(B):
-        prev = -1
-        seq: List[int] = []
-        for t in range(T):
-            p = int(pred[b, t].item())
-            if p != 0 and p != prev:  # remove blanks(0) and repeats
-                seq.append(p)
-            prev = p
-        hyps.append(seq)
-    return hyps
-
-def train_one_epoch(model, criterion, data_loader, optimizer, device, scaler, epoch, accum: int = 1, max_norm: float = 1.0):
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-
-    running_loss = 0.0
-    num_samples = 0
-    skipped = 0
-
-    start = time.time()
-    for it, batch in enumerate(data_loader):
-        batch = _move_batch(batch, device)
-        images = batch["images"]
-        qgrids = batch["qgrids"]
-        keypoints = batch["keypoints"]
-        targets = batch["targets"]
-        target_lengths = batch["target_lengths"]
-        qgrid_lengths = batch.get("qgrid_lengths", None)
-
-        B = images.size(0) if images is not None else 0
-        num_samples += B
-
+def preflight_print(gloss_path: str, shift_labels_by: int, num_classes: int, blank_idx: int):
+    if is_main_process():
         try:
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                logits = model(images, qgrids, keypoints, qgrid_lengths=qgrid_lengths)  # (B,T,V)
-                log_probs = F.log_softmax(logits, dim=-1)
-                in_lens = _ctc_input_lengths(log_probs)
-                loss = criterion(log_probs.transpose(0, 1), targets, in_lens, target_lengths)
+            import numpy as np
+            arr = np.load(gloss_path, allow_pickle=True)
+            if isinstance(arr.item(), dict):
+                ids = list(arr.item().values())
+                gloss_min, gloss_max = min(ids), max(ids)
+            else:
+                ids = [int(v) for v in arr.ravel() if isinstance(v, (int, np.integer))]
+                gloss_min, gloss_max = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
+        except Exception:
+            gloss_min, gloss_max = (1, num_classes - 1)
 
-            if (not torch.isfinite(loss)) or torch.isnan(loss):
-                skipped += 1
-                optimizer.zero_grad(set_to_none=True)
-                if _is_main():
-                    print(f"[warn] non-finite loss at step {it}, skipping batch")
-                continue
+        print(f"[preflight] gloss_id_range=[{gloss_min}, {gloss_max}]  "
+              f"shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}", flush=True)
 
-            (loss / max(1, accum)).backward()
-            if (it + 1) % accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
 
-            running_loss += float(loss.detach().item()) * B
-
-        except RuntimeError as e:
-            skipped += 1
-            optimizer.zero_grad(set_to_none=True)
-            if _is_main():
-                print("\n[BatchError] Skipping batch due to exception.")
-                print("  exception:", repr(e))
-                print("  shapes: imgs", None if images is None else tuple(images.shape),
-                      "qgrids", None if qgrids is None else tuple(qgrids.shape),
-                      "keypoints", None if keypoints is None else tuple(keypoints.shape))
-                if targets.numel():
-                    print("  targets: min", int(targets.min()), "max", int(targets.max()), "numel", targets.numel())
-                if qgrid_lengths is not None:
-                    print("  qgrid_lengths: min", int(qgrid_lengths.min()), "max", int(qgrid_lengths.max()))
+def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torch.Tensor]:
+    for t in cands:
+        if t is None or t.dim() != 1:
             continue
+        if int(t.max().item()) <= target_dim:
+            return t
+    return None
 
-        if _is_main() and (it % 50 == 0):
-            now = time.time()
-            print(f"Epoch: [{epoch}]  [{it}/{len(data_loader)}]  loss: {running_loss / max(1,num_samples):.4f}  accum:{accum}  time/50b: {now - start:.1f}s")
-            start = now
 
-    return {"loss": running_loss / max(1, num_samples), "skipped": skipped}
+def unpack_batch(batch: Any) -> Dict[str, Any]:
+    """
+    The dataset's collate returns a tuple. We infer components by shape/dtype:
+      - images: (B,T,C,H,W)
+      - qgrids/keypoints: (B,T,D)
+      - labels: (B,Lmax) long
+      - lengths: 1D longs that should be <= their respective padded dims
+    Returns a dict with keys: images, qgrids, keypoints, qgrid_lengths, labels, label_lengths, image_lengths
+    Missing pieces may be None (handled later).
+    """
+    if isinstance(batch, dict):
+        return batch
 
-@torch.no_grad()
-def evaluate(model, data_loader, device) -> float:
-    model.eval()
-    total_wer = 0.0
-    N = 0
-    for batch in data_loader:
-        batch = _move_batch(batch, device)
-        images = batch["images"]; qgrids = batch["qgrids"]; keypoints = batch["keypoints"]
-        qgrid_lengths = batch.get("qgrid_lengths", None)
-        logits = model(images, qgrids, keypoints, qgrid_lengths=qgrid_lengths)
-        log_probs = F.log_softmax(logits, dim=-1)
-        hyps = _greedy_decode_ctc(log_probs)
-        # TODO: plug real WER computation using ground truth (not included here)
-        total_wer += 0.0
-        N += 1
-    return (total_wer / max(1, N)) * 100.0
+    if not isinstance(batch, (list, tuple)):
+        raise RuntimeError(f"Unexpected batch type {type(batch)}")
 
-def build_args():
-    ap = argparse.ArgumentParser()
+    imgs = None; qg = None; kp = None; labels = None
+    one_d_lens: List[torch.Tensor] = []
 
-    # data
-    ap.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
-    ap.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
-    ap.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
-    ap.add_argument("--meta_dir",     required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
-    ap.add_argument("--gloss_dict",   required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
-    ap.add_argument("--out_dir",      default="checkpoints/multimodal_ddp")
+    for item in batch:
+        if torch.is_tensor(item):
+            if item.dim() == 5 and item.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                imgs = item
+            elif item.dim() == 3 and item.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                if qg is None:
+                    qg = item
+                else:
+                    kp = item
+            elif item.dim() == 2 and item.dtype in (torch.int32, torch.int64, torch.long):
+                labels = item
+            elif item.dim() == 1 and item.dtype in (torch.int32, torch.int64, torch.long):
+                one_d_lens.append(item)
 
-    # training
-    ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--num_workers", type=int, default=8)
-    ap.add_argument("--accum", type=int, default=2)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--weight_decay", type=float, default=0.05)
+    B = imgs.size(0) if imgs is not None else (labels.size(0) if labels is not None else batch[0].size(0))
 
-    # model sizing
-    ap.add_argument("--d_model", type=int, default=512)
-    ap.add_argument("--n_layer", type=int, default=12)
-    ap.add_argument("--fusion_embed", type=int, default=512)
-    ap.add_argument("--fusion_heads", type=int, default=8)
+    T_img = imgs.size(1) if imgs is not None else None
+    T_q = qg.size(1) if qg is not None else None
+    L_lab = labels.size(1) if labels is not None else None
 
-    # fusion / pooling
-    ap.add_argument("--max_kv", type=int, default=512, help="pooled qgrid length")
-    ap.add_argument("--pool_mode", default="mean", choices=["mean", "max", "vote"])
+    image_lengths = find_1d_lengths(one_d_lens, T_img or 10**9)
+    qgrid_lengths = find_1d_lengths(one_d_lens, T_q or 10**9)
+    label_lengths = find_1d_lengths(one_d_lens, L_lab or 10**9)
 
-    return ap.parse_args()
+    return {
+        "images": imgs,
+        "qgrids": qg,
+        "keypoints": kp,
+        "image_lengths": image_lengths if image_lengths is not None else (torch.full((B,), T_img or 1, dtype=torch.long, device=imgs.device if imgs is not None else labels.device)),
+        "qgrid_lengths": qgrid_lengths,
+        "labels": labels,
+        "label_lengths": label_lengths,
+    }
 
-def main():
-    _setup_dist()
-    args = build_args()
 
-    # PREFLIGHT
-    min_id, max_id = _compute_id_bounds_from_map(args.gloss_dict)
-    shift_labels_by = 1 if min_id == 0 else 0
-    num_classes = int(max_id + 1 + shift_labels_by)
-    blank_idx = 0
-    if _is_main():
-        print(f"[preflight] gloss_id_range=[{min_id}, {max_id}]  shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}")
+def flatten_targets(labels: torch.Tensor, label_lengths: torch.Tensor) -> torch.Tensor:
+    outs: List[torch.Tensor] = []
+    for i in range(labels.size(0)):
+        L = int(label_lengths[i].item())
+        if L > 0:
+            outs.append(labels[i, :L])
+    if len(outs) == 0:
+        return torch.zeros((0,), dtype=torch.long, device=labels.device)
+    return torch.cat(outs, dim=0)
 
-    # datasets
-    train_ds = MultiModalPhoenixDataset(
+
+def valid_ctc_targets(targets: torch.Tensor, num_classes: int, blank_idx: int) -> bool:
+    if targets.numel() == 0:
+        return True
+    tmin = int(targets.min().item())
+    tmax = int(targets.max().item())
+    if tmin < 0 or tmax >= num_classes:
+        return False
+    if (targets == blank_idx).any():
+        return False
+    return True
+
+
+def train(args):
+    device, local_rank = setup_ddp()
+    torch.backends.cudnn.benchmark = True
+
+    train_set = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
         kp_path=args.kp_path,
@@ -313,7 +153,7 @@ def main():
         gloss_dict_path=args.gloss_dict,
         split="train",
     )
-    val_ds = MultiModalPhoenixDataset(
+    val_set = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
         kp_path=args.kp_path,
@@ -322,51 +162,172 @@ def main():
         split="dev",
     )
 
-    # samplers
-    if dist.is_available() and dist.is_initialized():
-        train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=False)
-        val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False)
-    else:
-        train_sampler = None; val_sampler = None
+    train_sampler = DistributedSampler(train_set, shuffle=True) if torch.distributed.is_initialized() else None
+    val_sampler = DistributedSampler(val_set, shuffle=False) if torch.distributed.is_initialized() else None
 
-    # collate
-    collate_fn = make_collate_to_dict(shift_labels_by=shift_labels_by, blank_idx=blank_idx, num_classes=num_classes)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, sampler=train_sampler,
-                              shuffle=(train_sampler is None), pin_memory=True, drop_last=False, collate_fn=collate_fn)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.num_workers, sampler=val_sampler,
-                              shuffle=False, pin_memory=True, drop_last=False, collate_fn=collate_fn)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        num_workers=args.num_workers,
+        pin_memory=True,
+        sampler=train_sampler,
+        collate_fn=multi_modal_collate_fn,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        sampler=val_sampler,
+        collate_fn=multi_modal_collate_fn,
+        drop_last=False,
+    )
 
-    # model
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0))) if torch.cuda.is_available() else torch.device("cpu")
     model = MultiModalMamba(
-        d_model=args.d_model, n_layer=args.n_layer, fusion_embed=args.fusion_embed, fusion_heads=args.fusion_heads,
-        num_classes=num_classes, max_kv=args.max_kv, pool_mode=args.pool_mode,
+        d_model=args.d_model,
+        n_layer=args.n_layer,
+        fusion_embed=args.fusion_embed,
+        fusion_heads=args.fusion_heads,
+        num_classes=args.num_classes,
+        max_kv=args.max_kv,
+        pool_mode=args.pool_mode,
     ).to(device)
-    if dist.is_available() and dist.is_initialized():
-        model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
 
-    # loss & optim
-    criterion = ValidatedCTC(blank=blank_idx, num_classes=num_classes, expect_log_probs=False).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler()
+    if torch.distributed.is_initialized():
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    best_wer = 1e9
+    blank_idx = 0
+    ctc_loss = nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else None
+    if is_main_process():
+        preflight_print(args.gloss_dict, shift_labels_by=0, num_classes=args.num_classes, blank_idx=blank_idx)
+        if args.bf16 and not use_bf16:
+            print("[warn] --bf16 requested but not supported on this GPU/driver; training in fp32.", flush=True)
+
+    step = 0
     for epoch in range(args.epochs):
-        if isinstance(train_sampler, DistributedSampler):
+        if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        stats = train_one_epoch(model, criterion, train_loader, optimizer, device, scaler, epoch, accum=args.accum, max_norm=1.0)
+        model.train()
+        running = 0.0
+        seen = 0
+        for it, batch in enumerate(train_loader):
+            batch = unpack_batch(batch)
+            images = batch["images"].to(device, non_blocking=True) if batch["images"] is not None else None
+            qgrids = batch["qgrids"].to(device, non_blocking=True) if batch["qgrids"] is not None else None
+            keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
+            qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
+            label_lengths = batch["label_lengths"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
-        if _is_main():
-            print(f"[epoch {epoch}] train_loss={stats['loss']:.4f}  skipped={stats['skipped']}")
+            if use_bf16:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
+                    log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T,B,V)
+            else:
+                logits = model(images, qgrids, keypoints, qgrid_lengths)
+                log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
 
-        # (optional) evaluation placeholder
-        # wer = evaluate(model, val_loader, device)
+            B, T, V = logits.shape
+            input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
 
-    _cleanup_dist()
+            targets = flatten_targets(labels, label_lengths)
+            if not valid_ctc_targets(targets, args.num_classes, blank_idx):
+                if is_main_process():
+                    tmin = int(targets.min().item()) if targets.numel() else -1
+                    tmax = int(targets.max().item()) if targets.numel() else -1
+                    print(f"[skip-batch] invalid targets (min={tmin}, max={tmax}, V={args.num_classes}); step={step} epoch={epoch} it={it}", flush=True)
+                continue
+
+            loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            running += float(loss.item()) * B
+            seen += B
+            step += 1
+            if is_main_process() and (it % args.log_interval == 0):
+                print(f"Epoch: [{epoch}]  [{it}/{len(train_loader)}]  lr: {args.lr:.6f}  loss: {running/ max(1,seen):.4f}", flush=True)
+
+        model.eval()
+        val_loss = 0.0
+        val_seen = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = unpack_batch(batch)
+                images = batch["images"].to(device, non_blocking=True) if batch["images"] is not None else None
+                qgrids = batch["qgrids"].to(device, non_blocking=True) if batch["qgrids"] is not None else None
+                keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
+                qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
+                label_lengths = batch["label_lengths"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
+
+                if use_bf16:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        logits = model(images, qgrids, keypoints, qgrid_lengths)
+                        log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
+                else:
+                    logits = model(images, qgrids, keypoints, qgrid_lengths)
+                    log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
+
+                B, T, V = logits.shape
+                input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
+                targets = flatten_targets(labels, label_lengths)
+                if not valid_ctc_targets(targets, args.num_classes, 0):
+                    continue
+                loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
+                val_loss += float(loss.item()) * B
+                val_seen += B
+
+        if is_main_process():
+            avg_train = running / max(1, seen)
+            avg_val = val_loss / max(1, val_seen)
+            print(f"[epoch {epoch}] train_loss={avg_train:.4f}  val_loss={avg_val:.4f}", flush=True)
+
+    cleanup_ddp()
+
+
+def get_args():
+    p = argparse.ArgumentParser()
+    # data
+    p.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
+    p.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
+    p.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
+    p.add_argument("--meta_dir",     required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
+    p.add_argument("--gloss_dict",   required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
+    p.add_argument("--out_dir",      default="checkpoints/multimodal_ddp")
+    # Model
+    p.add_argument("--d_model", type=int, default=512)
+    p.add_argument("--n_layer", type=int, default=12)
+    p.add_argument("--fusion_embed", type=int, default=512)
+    p.add_argument("--fusion_heads", type=int, default=8)
+    p.add_argument("--num_classes", type=int, default=1296)
+    p.add_argument("--max_kv", type=int, default=512)
+    p.add_argument("--pool_mode", type=str, default="mean", choices=["mean", "max", "vote"])
+    # Train
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--log_interval", type=int, default=50)
+    # Precision
+    p.add_argument("--bf16", action="store_true", help="enable autocast bfloat16 if supported")
+    return p.parse_args()
+
 
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    train(args)
 
 
 
