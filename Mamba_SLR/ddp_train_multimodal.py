@@ -1,7 +1,5 @@
 #!/usr/bin/env python
-# ddp_train_multimodal.py
-# DDP trainer with robust dummy materialization and a runtime adapter that lets
-# a 4D frame encoder consume 5D (B,T,C,H,W) video batches safely.
+# ddp_train_multimodal.py — robust against NaNs/overflow with bf16 + CTC
 
 import os
 import argparse
@@ -13,13 +11,9 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-# --- dataset import (repo layout variations) ---
-try:
-    from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
-except Exception:
-    from slr.data.multi_modal_multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn  # fallback if layout differs
-
-# --- model ---
+# dataset
+from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
+# model
 from slr.models.multi_modal_model import MultiModalMamba
 
 
@@ -28,15 +22,14 @@ def is_main() -> bool:
 
 
 def setup_ddp():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
-        return device, local_rank
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return device, 0
+        return torch.device("cuda", local_rank), local_rank
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu"), 0
 
 
 def cleanup_ddp():
@@ -50,15 +43,9 @@ def preflight_print(gloss_path: str, shift_labels_by: int, num_classes: int, bla
     try:
         import numpy as np
         arr = np.load(gloss_path, allow_pickle=True)
-        if hasattr(arr, "item"):
-            try:
-                d = arr.item()
-                ids = list(d.values())
-            except Exception:
-                ids = [int(v) for v in arr.ravel()]
-        else:
-            ids = [int(v) for v in arr.ravel()]
-        gmin, gmax = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
+        vals = (arr.item().values() if hasattr(arr, "item") else arr.ravel().tolist())
+        ids = [int(v) for v in vals]
+        gmin, gmax = (min(ids), max(ids)) if ids else (1, num_classes - 1)
     except Exception:
         gmin, gmax = (1, num_classes - 1)
     print(f"[preflight] gloss_id_range=[{gmin}, {gmax}]  shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}", flush=True)
@@ -66,38 +53,22 @@ def preflight_print(gloss_path: str, shift_labels_by: int, num_classes: int, bla
 
 def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torch.Tensor]:
     for t in cands:
-        if t is None or t.dim() != 1:
-            continue
-        if int(t.max().item()) <= target_dim:
+        if t is not None and t.dim() == 1 and int(t.max().item()) <= target_dim:
             return t
     return None
 
 
 def unpack_batch(batch: Any) -> Dict[str, Any]:
-    """
-    The collate returns a tuple. Infer fields by shapes:
-      - images: (B,T,C,H,W) float
-      - qgrids/keypoints: (B,T,D) float
-      - labels: (B,Lmax) long
-      - 1D lengths: long (for images/qgrid/labels)
-    """
     if isinstance(batch, dict):
         return batch
 
-    if not isinstance(batch, (list, tuple)):
-        raise RuntimeError(f"Unexpected batch type {type(batch)}")
-
-    imgs = None
-    qg = None
-    kp = None
-    labels = None
+    imgs = qg = kp = labels = None
     one_d = []
-
     for item in batch:
         if torch.is_tensor(item):
-            if item.dim() == 5 and item.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            if item.dim() == 5 and item.is_floating_point():
                 imgs = item
-            elif item.dim() == 3 and item.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            elif item.dim() == 3 and item.is_floating_point():
                 if qg is None:
                     qg = item
                 else:
@@ -107,31 +78,20 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
             elif item.dim() == 1 and item.dtype in (torch.int32, torch.int64, torch.long):
                 one_d.append(item)
 
-    B = imgs.size(0) if imgs is not None else (labels.size(0) if labels is not None else batch[0].size(0))
-    T_img = imgs.size(1) if imgs is not None else None
-    T_q = qg.size(1) if qg is not None else None
-    L_lab = labels.size(1) if labels is not None else None
+    B = (imgs.size(0) if imgs is not None else labels.size(0))
+    dev = (imgs.device if imgs is not None else labels.device)
+    T_img = imgs.size(1) if imgs is not None else 0
+    T_q = qg.size(1) if qg is not None else 0
+    L_lab = labels.size(1) if labels is not None else 0
 
-    dev = (imgs.device if imgs is not None else (labels.device if labels is not None else torch.device("cpu")))
-    image_lengths = find_1d_lengths(one_d, T_img or 10**9)
-    qgrid_lengths = find_1d_lengths(one_d, T_q or 10**9)
-    label_lengths = find_1d_lengths(one_d, L_lab or 10**9)
-
-    if image_lengths is None and T_img is not None:
-        image_lengths = torch.full((B,), T_img, dtype=torch.long, device=dev)
-    if qgrid_lengths is None and T_q is not None:
-        qgrid_lengths = torch.full((B,), T_q, dtype=torch.long, device=dev)
-    if label_lengths is None and L_lab is not None:
-        label_lengths = torch.full((B,), L_lab, dtype=torch.long, device=dev)
+    image_lengths = find_1d_lengths(one_d, T_img) or torch.full((B,), T_img, dtype=torch.long, device=dev)
+    qgrid_lengths = find_1d_lengths(one_d, T_q) or torch.full((B,), T_q, dtype=torch.long, device=dev)
+    label_lengths = find_1d_lengths(one_d, L_lab) or torch.full((B,), L_lab, dtype=torch.long, device=dev)
 
     return {
-        "images": imgs,
-        "qgrids": qg,
-        "keypoints": kp,
-        "image_lengths": image_lengths,
-        "qgrid_lengths": qgrid_lengths,
-        "labels": labels,
-        "label_lengths": label_lengths,
+        "images": imgs, "qgrids": qg, "keypoints": kp,
+        "image_lengths": image_lengths, "qgrid_lengths": qgrid_lengths,
+        "labels": labels, "label_lengths": label_lengths,
     }
 
 
@@ -141,9 +101,7 @@ def flatten_targets(labels: torch.Tensor, label_lengths: torch.Tensor) -> torch.
         L = int(label_lengths[i].item())
         if L > 0:
             outs.append(labels[i, :L])
-    if len(outs) == 0:
-        return torch.zeros((0,), dtype=torch.long, device=labels.device)
-    return torch.cat(outs, dim=0)
+    return torch.cat(outs, dim=0) if outs else torch.zeros((0,), device=labels.device, dtype=torch.long)
 
 
 def valid_ctc_targets(targets: torch.Tensor, num_classes: int, blank_idx: int) -> bool:
@@ -151,11 +109,7 @@ def valid_ctc_targets(targets: torch.Tensor, num_classes: int, blank_idx: int) -
         return True
     tmin = int(targets.min().item())
     tmax = int(targets.max().item())
-    if tmin < 0 or tmax >= num_classes:
-        return False
-    if (targets == blank_idx).any():
-        return False
-    return True
+    return (0 <= tmin) and (tmax < num_classes) and not (targets == blank_idx).any()
 
 
 def save_ckpt(state: Dict, out_dir: str, name: str):
@@ -167,74 +121,52 @@ def save_ckpt(state: Dict, out_dir: str, name: str):
 
 
 def wrap_frame_encoder_for_5d(model: nn.Module):
-    """
-    If model.frame_encoder expects 4D (B_T,C,H,W), wrap it so it can take 5D (B,T,C,H,W).
-    We reshape to 4D, call the original, then reshape back to (B,T,*) or mean-pool if needed.
-    """
     if not hasattr(model, "frame_encoder"):
         return
-
     fe = model.frame_encoder
     if not hasattr(fe, "forward"):
         return
-
     orig_forward = fe.forward
 
     def adapter(x: torch.Tensor, *args, **kwargs):
-        # If already 4D, just pass through.
         if x.dim() == 4:
             return orig_forward(x, *args, **kwargs)
-
-        # If 5D video batch: (B,T,C,H,W) -> (B*T,C,H,W)
         if x.dim() == 5:
             B, T, C, H, W = x.shape
-            x4 = x.reshape(B * T, C, H, W)
-            y = orig_forward(x4, *args, **kwargs)
-
-            # y can be (B*T, D) or (B*T, S, D). Return (B,T,D).
+            y = orig_forward(x.reshape(B * T, C, H, W), *args, **kwargs)
             if y.dim() == 2:
-                D = y.size(-1)
-                return y.view(B, T, D)
-            elif y.dim() == 3:
-                # (B*T, S, D) -> pool S, return (B,T,D)
-                y = y.mean(dim=1)
-                D = y.size(-1)
-                return y.view(B, T, D)
-            else:
-                raise RuntimeError(f"Unsupported frame_encoder output shape {tuple(y.shape)}")
-
-        raise RuntimeError(f"frame_encoder received tensor with shape {tuple(x.shape)} (expected 4D or 5D)")
+                return y.view(B, T, -1)
+            if y.dim() == 3:
+                return y.mean(dim=1).view(B, T, -1)
+            raise RuntimeError(f"Unsupported frame_encoder output shape {tuple(y.shape)}")
+        raise RuntimeError(f"frame_encoder input must be 4D/5D, got {tuple(x.shape)}")
 
     fe.forward = adapter
     if is_main():
         print("[adapter] Wrapped frame_encoder to accept 5D (B,T,C,H,W) and return (B,T,D).", flush=True)
 
 
+def sanitize_(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if t is None:
+        return None
+    return torch.nan_to_num(t, nan=0.0, posinf=1e4, neginf=-1e4)
+
+
 @torch.no_grad()
-def materialize_params_with_dummy_forward(model: nn.Module,
-                                          loader: DataLoader,
-                                          device: torch.device,
-                                          use_bf16: bool):
-    """Run one real batch forward to initialize all lazy params before DDP."""
+def materialize_params_with_dummy_forward(model: nn.Module, loader: DataLoader, device: torch.device, use_bf16: bool):
     model.eval()
     try:
-        data_iter = iter(loader)
-        batch = next(data_iter)
+        batch = next(iter(loader))
     except StopIteration:
         return
-
-    batch = unpack_batch(batch)
-    images = batch["images"].to(device, non_blocking=True) if batch["images"] is not None else None
-    qgrids = batch["qgrids"].to(device, non_blocking=True) if batch["qgrids"] is not None else None
-    keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
-    qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
-
-    if use_bf16:
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _ = model(images, qgrids, keypoints, qgrid_lengths)
-    else:
+    b = unpack_batch(batch)
+    images = sanitize_(b["images"]).to(device, non_blocking=True) if b["images"] is not None else None
+    qgrids = sanitize_(b["qgrids"]).to(device, non_blocking=True) if b["qgrids"] is not None else None
+    keypoints = sanitize_(b["keypoints"]).to(device, non_blocking=True) if b["keypoints"] is not None else None
+    qgrid_lengths = b["qgrid_lengths"].to(device, non_blocking=True) if b["qgrid_lengths"] is not None else None
+    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else torch.cuda.amp.autocast(enabled=False)
+    with ctx:
         _ = model(images, qgrids, keypoints, qgrid_lengths)
-
     torch.cuda.synchronize(device)
     model.train()
     if is_main():
@@ -243,75 +175,48 @@ def materialize_params_with_dummy_forward(model: nn.Module,
 
 def train(args):
     device, local_rank = setup_ddp()
-    torch.backends.cudnn.benchmark = True
 
-    # --- datasets ---
+    # datasets/loaders
     train_set = MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix,
-        qgrid_prefix=args.qgrid_prefix,
-        kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,
-        gloss_dict_path=args.gloss_dict,
-        split="train",
+        image_prefix=args.image_prefix, qgrid_prefix=args.qgrid_prefix, kp_path=args.kp_path,
+        meta_dir_path=args.meta_dir, gloss_dict_path=args.gloss_dict, split="train"
     )
     val_set = MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix,
-        qgrid_prefix=args.qgrid_prefix,
-        kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,
-        gloss_dict_path=args.gloss_dict,
-        split="dev",
+        image_prefix=args.image_prefix, qgrid_prefix=args.qgrid_prefix, kp_path=args.kp_path,
+        meta_dir_path=args.meta_dir, gloss_dict_path=args.gloss_dict, split="dev"
     )
-
     train_sampler = DistributedSampler(train_set, shuffle=True) if torch.distributed.is_initialized() else None
     val_sampler = DistributedSampler(val_set, shuffle=False) if torch.distributed.is_initialized() else None
 
     train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=args.num_workers,
-        pin_memory=True,
-        sampler=train_sampler,
-        collate_fn=multi_modal_collate_fn,
-        drop_last=False,
+        train_set, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.num_workers, pin_memory=True, sampler=train_sampler,
+        collate_fn=multi_modal_collate_fn, drop_last=False,
     )
     val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        sampler=val_sampler,
-        collate_fn=multi_modal_collate_fn,
-        drop_last=False,
+        val_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True, sampler=val_sampler,
+        collate_fn=multi_modal_collate_fn, drop_last=False,
     )
 
-    # --- model ---
+    # model
     model = MultiModalMamba(
-        d_model=args.d_model,
-        n_layer=args.n_layer,
-        fusion_embed=args.fusion_embed,
-        fusion_heads=args.fusion_heads,
-        num_classes=args.num_classes,
-        max_kv=args.max_kv,
-        pool_mode=args.pool_mode,
+        d_model=args.d_model, n_layer=args.n_layer, fusion_embed=args.fusion_embed,
+        fusion_heads=args.fusion_heads, num_classes=args.num_classes,
+        max_kv=args.max_kv, pool_mode=args.pool_mode,
     ).to(device)
 
-    # **CRITICAL**: wrap frame_encoder so it can consume (B,T,C,H,W)
     wrap_frame_encoder_for_5d(model)
 
-    # precision
     use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     if is_main():
-        preflight_print(args.gloss_dict, shift_labels_by=0, num_classes=args.num_classes, blank_idx=0)
+        preflight_print(args.gloss_dict, 0, args.num_classes, 0)
         if args.bf16 and not use_bf16:
             print("[warn] --bf16 requested but not supported; training in fp32.", flush=True)
 
-    # >>> materialize BEFORE DDP <<<
+    # materialize before DDP
     materialize_params_with_dummy_forward(model, train_loader, device, use_bf16)
 
-    # wrap with DDP
     if torch.distributed.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
@@ -333,96 +238,127 @@ def train(args):
         seen = 0
 
         for it, batch in enumerate(train_loader):
-            batch = unpack_batch(batch)
-            images = batch["images"].to(device, non_blocking=True) if batch["images"] is not None else None
-            qgrids = batch["qgrids"].to(device, non_blocking=True) if batch["qgrids"] is not None else None
-            keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
-            qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
-            label_lengths = batch["label_lengths"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
+            b = unpack_batch(batch)
+            images = sanitize_(b["images"])
+            qgrids = sanitize_(b["qgrids"])
+            keypoints = sanitize_(b["keypoints"])
+            labels = b["labels"]
+            label_lengths = b["label_lengths"]
+            qgrid_lengths = b["qgrid_lengths"]
 
-            if use_bf16:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
-                    log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T,B,V)
-            else:
-                logits = model(images, qgrids, keypoints, qgrid_lengths)
-                log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
+            images = images.to(device, non_blocking=True) if images is not None else None
+            qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
+            keypoints = keypoints.to(device, non_blocking=True) if keypoints is not None else None
+            labels = labels.to(device, non_blocking=True)
+            label_lengths = label_lengths.to(device, non_blocking=True)
+            qgrid_lengths = qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None
 
+            ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else torch.cuda.amp.autocast(enabled=False)
+            with ctx:
+                logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
+
+            # If logits blew up, keep DDP in sync with zero loss
+            if not torch.isfinite(logits).all():
+                if is_main():
+                    print(f"[nan] non-finite logits at epoch={epoch} it={it}; zeroing batch", flush=True)
+                zero_loss = (logits * 0).sum()  # keeps graph + DDP happy
+                (zero_loss / accum).backward()
+                if ((global_step + 1) % accum == 0) or (it + 1 == len(train_loader)):
+                    if args.clip_grad > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                continue
+
+            # Do numerically sensitive parts in FP32
             B, T, V = logits.shape
+            log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)  # (T,B,V) in fp32
             input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
-
             targets = flatten_targets(labels, label_lengths)
+
             if not valid_ctc_targets(targets, args.num_classes, blank_idx):
                 if is_main():
                     tmin = int(targets.min().item()) if targets.numel() else -1
                     tmax = int(targets.max().item()) if targets.numel() else -1
                     print(f"[skip-batch] invalid targets (min={tmin}, max={tmax}, V={args.num_classes}); step={global_step} epoch={epoch} it={it}", flush=True)
-                continue
+                # still run a zero backward to keep DDP synchronized
+                (logits.sum() * 0 / accum).backward()
+            else:
+                loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
+                if not torch.isfinite(loss):
+                    if is_main():
+                        print(f"[nan] CTCLoss non-finite at epoch={epoch} it={it}; zeroing batch", flush=True)
+                    (logits.sum() * 0 / accum).backward()
+                else:
+                    (loss / accum).backward()
+                    running += float(loss.item()) * B
+                    seen += B
 
-            loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
-            (loss / accum).backward()
-
-            if (global_step + 1) % accum == 0 or (it + 1) == len(train_loader):
+            if ((global_step + 1) % accum == 0) or (it + 1 == len(train_loader)):
+                if args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            running += float(loss.item()) * B
-            seen += B
             global_step += 1
-
             if is_main() and (it % args.log_interval == 0):
                 print(f"Epoch: [{epoch}]  [{it}/{len(train_loader)}]  lr: {args.lr:.6f}  loss: {running/max(1,seen):.4f}  accum:{accum}", flush=True)
 
-        # ---- validation ----
+        # ----- validation -----
         model.eval()
         val_loss = 0.0
         val_seen = 0
         with torch.no_grad():
             for batch in val_loader:
-                batch = unpack_batch(batch)
-                images = batch["images"].to(device, non_blocking=True) if batch["images"] is not None else None
-                qgrids = batch["qgrids"].to(device, non_blocking=True) if batch["qgrids"] is not None else None
-                keypoints = batch["keypoints"].to(device, non_blocking=True) if batch["keypoints"] is not None else None
-                qgrid_lengths = batch["qgrid_lengths"].to(device, non_blocking=True) if batch["qgrid_lengths"] is not None else None
-                label_lengths = batch["label_lengths"].to(device, non_blocking=True)
-                labels = batch["labels"].to(device, non_blocking=True)
+                b = unpack_batch(batch)
+                images = sanitize_(b["images"])
+                qgrids = sanitize_(b["qgrids"])
+                keypoints = sanitize_(b["keypoints"])
+                labels = b["labels"]
+                label_lengths = b["label_lengths"]
+                qgrid_lengths = b["qgrid_lengths"]
 
-                if use_bf16:
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        logits = model(images, qgrids, keypoints, qgrid_lengths)
-                        log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-                else:
+                images = images.to(device, non_blocking=True) if images is not None else None
+                qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
+                keypoints = keypoints.to(device, non_blocking=True) if keypoints is not None else None
+                labels = labels.to(device, non_blocking=True)
+                label_lengths = label_lengths.to(device, non_blocking=True)
+                qgrid_lengths = qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None
+
+                ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else torch.cuda.amp.autocast(enabled=False)
+                with ctx:
                     logits = model(images, qgrids, keypoints, qgrid_lengths)
-                    log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
 
+                if not torch.isfinite(logits).all():
+                    continue  # skip this val batch
+
+                log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)
                 B, T, V = logits.shape
                 input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
                 targets = flatten_targets(labels, label_lengths)
-                if not valid_ctc_targets(targets, args.num_classes, 0):
+                if not valid_ctc_targets(targets, args.num_classes, blank_idx):
                     continue
                 loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
-                val_loss += float(loss.item()) * B
-                val_seen += B
+                if torch.isfinite(loss):
+                    val_loss += float(loss.item()) * B
+                    val_seen += B
 
         if is_main():
             avg_train = running / max(1, seen)
             avg_val = val_loss / max(1, val_seen)
             print(f"[epoch {epoch}] train_loss={avg_train:.4f}  val_loss={avg_val:.4f}  (accum={accum})", flush=True)
 
-            # save last + best
             save_ckpt(
                 {"epoch": epoch, "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-                 "optimizer": optimizer.state_dict(),
-                 "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
+                 "optimizer": optimizer.state_dict(), "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
                 args.out_dir, "last.pt",
             )
             if avg_val < best_val:
                 best_val = avg_val
                 save_ckpt(
                     {"epoch": epoch, "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-                     "optimizer": optimizer.state_dict(),
-                     "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
+                     "optimizer": optimizer.state_dict(), "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
                     args.out_dir, "best.pt",
                 )
 
@@ -457,6 +393,7 @@ def get_args():
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--accum", type=int, default=1, help="gradient accumulation steps")
+    p.add_argument("--clip_grad", type=float, default=1.0, help="max grad-norm; 0 to disable")
 
     # precision
     p.add_argument("--bf16", action="store_true", help="enable autocast bfloat16 if supported")
@@ -467,6 +404,7 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     train(args)
+
 
 
 
