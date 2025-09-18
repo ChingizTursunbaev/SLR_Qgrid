@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-# ddp_train_multimodal.py — robust against NaNs/overflow with bf16 + CTC
+# ddp_train_multimodal.py — stable bf16+CTC, NaN-guards, LR warmup+cosine
 
-import os
+import os, math
 import argparse
 from typing import Any, Dict, List, Optional
 
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-# dataset
+# datasets / collate
 from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
 # model
 from slr.models.multi_modal_model import MultiModalMamba
@@ -69,10 +69,8 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
             if item.dim() == 5 and item.is_floating_point():
                 imgs = item
             elif item.dim() == 3 and item.is_floating_point():
-                if qg is None:
-                    qg = item
-                else:
-                    kp = item
+                if qg is None: qg = item
+                else:          kp = item
             elif item.dim() == 2 and item.dtype in (torch.int32, torch.int64, torch.long):
                 labels = item
             elif item.dim() == 1 and item.dtype in (torch.int32, torch.int64, torch.long):
@@ -81,11 +79,11 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
     B = (imgs.size(0) if imgs is not None else labels.size(0))
     dev = (imgs.device if imgs is not None else labels.device)
     T_img = imgs.size(1) if imgs is not None else 0
-    T_q = qg.size(1) if qg is not None else 0
+    T_q   = qg.size(1)   if qg   is not None else 0
     L_lab = labels.size(1) if labels is not None else 0
 
     image_lengths = find_1d_lengths(one_d, T_img) or torch.full((B,), T_img, dtype=torch.long, device=dev)
-    qgrid_lengths = find_1d_lengths(one_d, T_q) or torch.full((B,), T_q, dtype=torch.long, device=dev)
+    qgrid_lengths = find_1d_lengths(one_d, T_q)   or torch.full((B,), T_q,   dtype=torch.long, device=dev)
     label_lengths = find_1d_lengths(one_d, L_lab) or torch.full((B,), L_lab, dtype=torch.long, device=dev)
 
     return {
@@ -99,16 +97,13 @@ def flatten_targets(labels: torch.Tensor, label_lengths: torch.Tensor) -> torch.
     outs = []
     for i in range(labels.size(0)):
         L = int(label_lengths[i].item())
-        if L > 0:
-            outs.append(labels[i, :L])
+        if L > 0: outs.append(labels[i, :L])
     return torch.cat(outs, dim=0) if outs else torch.zeros((0,), device=labels.device, dtype=torch.long)
 
 
 def valid_ctc_targets(targets: torch.Tensor, num_classes: int, blank_idx: int) -> bool:
-    if targets.numel() == 0:
-        return True
-    tmin = int(targets.min().item())
-    tmax = int(targets.max().item())
+    if targets.numel() == 0: return True
+    tmin = int(targets.min().item()); tmax = int(targets.max().item())
     return (0 <= tmin) and (tmax < num_classes) and not (targets == blank_idx).any()
 
 
@@ -116,16 +111,12 @@ def save_ckpt(state: Dict, out_dir: str, name: str):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
     torch.save(state, path)
-    if is_main():
-        print(f"[ckpt] saved -> {path}", flush=True)
+    if is_main(): print(f"[ckpt] saved -> {path}", flush=True)
 
 
 def wrap_frame_encoder_for_5d(model: nn.Module):
-    if not hasattr(model, "frame_encoder"):
-        return
+    if not hasattr(model, "frame_encoder"): return
     fe = model.frame_encoder
-    if not hasattr(fe, "forward"):
-        return
     orig_forward = fe.forward
 
     def adapter(x: torch.Tensor, *args, **kwargs):
@@ -133,44 +124,56 @@ def wrap_frame_encoder_for_5d(model: nn.Module):
             return orig_forward(x, *args, **kwargs)
         if x.dim() == 5:
             B, T, C, H, W = x.shape
-            y = orig_forward(x.reshape(B * T, C, H, W), *args, **kwargs)
-            if y.dim() == 2:
-                return y.view(B, T, -1)
-            if y.dim() == 3:
-                return y.mean(dim=1).view(B, T, -1)
-            raise RuntimeError(f"Unsupported frame_encoder output shape {tuple(y.shape)}")
+            y = orig_forward(x.reshape(B*T, C, H, W), *args, **kwargs)
+            if y.dim() == 2: return y.view(B, T, -1)
+            if y.dim() == 3: return y.mean(dim=1).view(B, T, -1)
+            raise RuntimeError(f"Unsupported frame_encoder output {tuple(y.shape)}")
         raise RuntimeError(f"frame_encoder input must be 4D/5D, got {tuple(x.shape)}")
 
     fe.forward = adapter
-    if is_main():
-        print("[adapter] Wrapped frame_encoder to accept 5D (B,T,C,H,W) and return (B,T,D).", flush=True)
+    if is_main(): print("[adapter] Wrapped frame_encoder to accept 5D (B,T,C,H,W) -> (B,T,D).", flush=True)
 
 
 def sanitize_(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if t is None:
-        return None
+    if t is None: return None
     return torch.nan_to_num(t, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
 @torch.no_grad()
 def materialize_params_with_dummy_forward(model: nn.Module, loader: DataLoader, device: torch.device, use_bf16: bool):
     model.eval()
-    try:
-        batch = next(iter(loader))
-    except StopIteration:
-        return
+    try: batch = next(iter(loader))
+    except StopIteration: return
     b = unpack_batch(batch)
     images = sanitize_(b["images"]).to(device, non_blocking=True) if b["images"] is not None else None
     qgrids = sanitize_(b["qgrids"]).to(device, non_blocking=True) if b["qgrids"] is not None else None
     keypoints = sanitize_(b["keypoints"]).to(device, non_blocking=True) if b["keypoints"] is not None else None
     qgrid_lengths = b["qgrid_lengths"].to(device, non_blocking=True) if b["qgrid_lengths"] is not None else None
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else torch.cuda.amp.autocast(enabled=False)
-    with ctx:
-        _ = model(images, qgrids, keypoints, qgrid_lengths)
-    torch.cuda.synchronize(device)
-    model.train()
-    if is_main():
-        print("[ddp] dummy forward ran; parameters materialized.", flush=True)
+    with ctx: _ = model(images, qgrids, keypoints, qgrid_lengths)
+    torch.cuda.synchronize(device); model.train()
+    if is_main(): print("[ddp] dummy forward ran; parameters materialized.", flush=True)
+
+
+def build_scheduler(optimizer, warmup_steps: int, total_steps: int, base_lr: float, min_lr: float):
+    # returns LambdaLR that does linear warmup to base_lr then cosine down to min_lr
+    min_ratio = max(1e-8, min_lr / max(1e-12, base_lr))
+
+    def lr_lambda(step: int):
+        if warmup_steps > 0 and step < warmup_steps:
+            return (step + 1) / float(warmup_steps)
+        if total_steps <= warmup_steps:
+            return 1.0
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(min_ratio, cosine)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def maybe_freeze_frame_encoder(model: nn.Module, freeze: bool):
+    if not hasattr(model, "frame_encoder"): return
+    for p in model.frame_encoder.parameters(): p.requires_grad = not freeze
 
 
 def train(args):
@@ -186,7 +189,7 @@ def train(args):
         meta_dir_path=args.meta_dir, gloss_dict_path=args.gloss_dict, split="dev"
     )
     train_sampler = DistributedSampler(train_set, shuffle=True) if torch.distributed.is_initialized() else None
-    val_sampler = DistributedSampler(val_set, shuffle=False) if torch.distributed.is_initialized() else None
+    val_sampler   = DistributedSampler(val_set,   shuffle=False) if torch.distributed.is_initialized() else None
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=(train_sampler is None),
@@ -200,13 +203,13 @@ def train(args):
     )
 
     # model
-    model = MultiModalMamba(
+    base_model = MultiModalMamba(
         d_model=args.d_model, n_layer=args.n_layer, fusion_embed=args.fusion_embed,
         fusion_heads=args.fusion_heads, num_classes=args.num_classes,
         max_kv=args.max_kv, pool_mode=args.pool_mode,
     ).to(device)
 
-    wrap_frame_encoder_for_5d(model)
+    wrap_frame_encoder_for_5d(base_model)
 
     use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     if is_main():
@@ -215,22 +218,35 @@ def train(args):
             print("[warn] --bf16 requested but not supported; training in fp32.", flush=True)
 
     # materialize before DDP
-    materialize_params_with_dummy_forward(model, train_loader, device, use_bf16)
+    materialize_params_with_dummy_forward(base_model, train_loader, device, use_bf16)
 
+    model = base_model
     if torch.distributed.is_initialized():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        model = DDP(base_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     blank_idx = 0
     ctc_loss = nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # scheduler setup
+    steps_per_epoch = (len(train_loader) + args.accum - 1) // args.accum
+    total_updates = steps_per_epoch * args.epochs
+    scheduler = build_scheduler(optimizer, args.warmup_steps, total_updates, base_lr=args.lr, min_lr=args.min_lr)
+
     accum = max(1, int(args.accum))
-    global_step = 0
+    global_update = 0
     best_val = float("inf")
 
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+
+        # optional early freeze to stabilize head
+        freeze_now = (epoch < args.freeze_frames_epochs)
+        if isinstance(model, DDP):
+            maybe_freeze_frame_encoder(model.module, freeze_now)
+        else:
+            maybe_freeze_frame_encoder(model, freeze_now)
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -257,53 +273,40 @@ def train(args):
             with ctx:
                 logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
 
-            # If logits blew up, keep DDP in sync with zero loss
             if not torch.isfinite(logits).all():
-                if is_main():
-                    print(f"[nan] non-finite logits at epoch={epoch} it={it}; zeroing batch", flush=True)
-                zero_loss = (logits * 0).sum()  # keeps graph + DDP happy
-                (zero_loss / accum).backward()
-                if ((global_step + 1) % accum == 0) or (it + 1 == len(train_loader)):
-                    if args.clip_grad > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                continue
-
-            # Do numerically sensitive parts in FP32
-            B, T, V = logits.shape
-            log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)  # (T,B,V) in fp32
-            input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
-            targets = flatten_targets(labels, label_lengths)
-
-            if not valid_ctc_targets(targets, args.num_classes, blank_idx):
-                if is_main():
-                    tmin = int(targets.min().item()) if targets.numel() else -1
-                    tmax = int(targets.max().item()) if targets.numel() else -1
-                    print(f"[skip-batch] invalid targets (min={tmin}, max={tmax}, V={args.num_classes}); step={global_step} epoch={epoch} it={it}", flush=True)
-                # still run a zero backward to keep DDP synchronized
+                # keep DDP sync
                 (logits.sum() * 0 / accum).backward()
             else:
-                loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
-                if not torch.isfinite(loss):
-                    if is_main():
-                        print(f"[nan] CTCLoss non-finite at epoch={epoch} it={it}; zeroing batch", flush=True)
+                B, T, V = logits.shape
+                log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)  # (T,B,V) fp32
+                input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
+                targets = flatten_targets(labels, label_lengths)
+
+                if not valid_ctc_targets(targets, args.num_classes, blank_idx):
                     (logits.sum() * 0 / accum).backward()
                 else:
-                    (loss / accum).backward()
-                    running += float(loss.item()) * B
-                    seen += B
+                    loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
+                    if torch.isfinite(loss):
+                        (loss / accum).backward()
+                        running += float(loss.item()) * B
+                        seen += B
+                    else:
+                        (logits.sum() * 0 / accum).backward()
 
-            if ((global_step + 1) % accum == 0) or (it + 1 == len(train_loader)):
+            # optimizer step & scheduler step every 'accum' mini-batches
+            do_step = (((it + 1) % accum) == 0) or (it + 1 == len(train_loader))
+            if do_step:
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                global_update += 1
 
-            global_step += 1
             if is_main() and (it % args.log_interval == 0):
-                print(f"Epoch: [{epoch}]  [{it}/{len(train_loader)}]  lr: {args.lr:.6f}  loss: {running/max(1,seen):.4f}  accum:{accum}", flush=True)
+                cur_lr = optimizer.param_groups[0]["lr"]
+                avg = running / max(1, seen)
+                print(f"Epoch: [{epoch}]  [{it}/{len(train_loader)}]  lr: {cur_lr:.6f}  loss: {avg:.4f}  accum:{accum}", flush=True)
 
         # ----- validation -----
         model.eval()
@@ -330,15 +333,13 @@ def train(args):
                 with ctx:
                     logits = model(images, qgrids, keypoints, qgrid_lengths)
 
-                if not torch.isfinite(logits).all():
-                    continue  # skip this val batch
+                if not torch.isfinite(logits).all(): continue
 
                 log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)
                 B, T, V = logits.shape
                 input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
                 targets = flatten_targets(labels, label_lengths)
-                if not valid_ctc_targets(targets, args.num_classes, blank_idx):
-                    continue
+                if not valid_ctc_targets(targets, args.num_classes, blank_idx): continue
                 loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
                 if torch.isfinite(loss):
                     val_loss += float(loss.item()) * B
@@ -346,19 +347,21 @@ def train(args):
 
         if is_main():
             avg_train = running / max(1, seen)
-            avg_val = val_loss / max(1, val_seen)
+            avg_val   = val_loss / max(1, val_seen)
             print(f"[epoch {epoch}] train_loss={avg_train:.4f}  val_loss={avg_val:.4f}  (accum={accum})", flush=True)
 
             save_ckpt(
                 {"epoch": epoch, "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-                 "optimizer": optimizer.state_dict(), "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
+                 "optimizer": optimizer.state_dict(), "avg_train_loss": avg_train, "avg_val_loss": avg_val,
+                 "accum": accum, "lr": optimizer.param_groups[0]["lr"]},
                 args.out_dir, "last.pt",
             )
             if avg_val < best_val:
                 best_val = avg_val
                 save_ckpt(
                     {"epoch": epoch, "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
-                     "optimizer": optimizer.state_dict(), "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
+                     "optimizer": optimizer.state_dict(), "avg_train_loss": avg_train, "avg_val_loss": avg_val,
+                     "accum": accum, "lr": optimizer.param_groups[0]["lr"]},
                     args.out_dir, "best.pt",
                 )
 
@@ -386,14 +389,17 @@ def get_args():
     p.add_argument("--pool_mode", type=str, default="mean", choices=["mean", "max", "vote"])
 
     # training
-    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--min_lr", type=float, default=1e-5, help="final LR for cosine schedule")
+    p.add_argument("--warmup_steps", type=int, default=1500, help="linear warmup steps")
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--log_interval", type=int, default=50)
-    p.add_argument("--accum", type=int, default=1, help="gradient accumulation steps")
+    p.add_argument("--accum", type=int, default=2, help="gradient accumulation steps")
     p.add_argument("--clip_grad", type=float, default=1.0, help="max grad-norm; 0 to disable")
+    p.add_argument("--freeze_frames_epochs", type=int, default=0, help="freeze frame encoder for N starting epochs")
 
     # precision
     p.add_argument("--bf16", action="store_true", help="enable autocast bfloat16 if supported")
@@ -404,6 +410,7 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     train(args)
+
 
 
 
