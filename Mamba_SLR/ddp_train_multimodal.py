@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # ddp_train_multimodal.py
-# Distributed training entrypoint for MultiModal Mamba SLR with length-safe model + optional BF16.
+# Distributed training for MultiModal Mamba SLR with gradient accumulation + BF16 (optional).
+
 import os
 import argparse
 from typing import Any, Dict, List, Optional
@@ -11,8 +12,14 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-# ---- Project imports ----
-from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
+# --- dataset import (your repo layout) ---
+try:
+    from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn
+except Exception:
+    # fallback if older path
+    from slr.data.multi_modal_datasets import MultiModalPhoenixDataset, multi_modal_collate_fn  # type: ignore
+
+# --- model ---
 from slr.models.multi_modal_model import MultiModalMamba
 
 
@@ -44,15 +51,13 @@ def preflight_print(gloss_path: str, shift_labels_by: int, num_classes: int, bla
             arr = np.load(gloss_path, allow_pickle=True)
             if isinstance(arr.item(), dict):
                 ids = list(arr.item().values())
-                gloss_min, gloss_max = min(ids), max(ids)
+                gmin, gmax = min(ids), max(ids)
             else:
                 ids = [int(v) for v in arr.ravel() if isinstance(v, (int, np.integer))]
-                gloss_min, gloss_max = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
+                gmin, gmax = (min(ids), max(ids)) if len(ids) else (1, num_classes - 1)
         except Exception:
-            gloss_min, gloss_max = (1, num_classes - 1)
-
-        print(f"[preflight] gloss_id_range=[{gloss_min}, {gloss_max}]  "
-              f"shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}", flush=True)
+            gmin, gmax = (1, num_classes - 1)
+        print(f"[preflight] gloss_id_range=[{gmin}, {gmax}]  shift_labels_by={shift_labels_by}  num_classes={num_classes}  blank_idx={blank_idx}", flush=True)
 
 
 def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torch.Tensor]:
@@ -66,13 +71,11 @@ def find_1d_lengths(cands: List[torch.Tensor], target_dim: int) -> Optional[torc
 
 def unpack_batch(batch: Any) -> Dict[str, Any]:
     """
-    The dataset's collate returns a tuple. We infer components by shape/dtype:
-      - images: (B,T,C,H,W)
-      - qgrids/keypoints: (B,T,D)
+    Your collate returns a tuple. We infer by shapes to avoid key assumptions:
+      - images: (B,T,C,H,W) float
+      - qgrids/keypoints: (B,T,D) float
       - labels: (B,Lmax) long
-      - lengths: 1D longs that should be <= their respective padded dims
-    Returns a dict with keys: images, qgrids, keypoints, qgrid_lengths, labels, label_lengths, image_lengths
-    Missing pieces may be None (handled later).
+      - 1D lengths: long (for images/qgrid/labels)
     """
     if isinstance(batch, dict):
         return batch
@@ -80,8 +83,11 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
     if not isinstance(batch, (list, tuple)):
         raise RuntimeError(f"Unexpected batch type {type(batch)}")
 
-    imgs = None; qg = None; kp = None; labels = None
-    one_d_lens: List[torch.Tensor] = []
+    imgs = None
+    qg = None
+    kp = None
+    labels = None
+    one_d = []
 
     for item in batch:
         if torch.is_tensor(item):
@@ -95,23 +101,24 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
             elif item.dim() == 2 and item.dtype in (torch.int32, torch.int64, torch.long):
                 labels = item
             elif item.dim() == 1 and item.dtype in (torch.int32, torch.int64, torch.long):
-                one_d_lens.append(item)
+                one_d.append(item)
 
     B = imgs.size(0) if imgs is not None else (labels.size(0) if labels is not None else batch[0].size(0))
-
     T_img = imgs.size(1) if imgs is not None else None
     T_q = qg.size(1) if qg is not None else None
     L_lab = labels.size(1) if labels is not None else None
 
-    image_lengths = find_1d_lengths(one_d_lens, T_img or 10**9)
-    qgrid_lengths = find_1d_lengths(one_d_lens, T_q or 10**9)
-    label_lengths = find_1d_lengths(one_d_lens, L_lab or 10**9)
+    image_lengths = find_1d_lengths(one_d, T_img or 10**9)
+    qgrid_lengths = find_1d_lengths(one_d, T_q or 10**9)
+    label_lengths = find_1d_lengths(one_d, L_lab or 10**9)
 
     return {
         "images": imgs,
         "qgrids": qg,
         "keypoints": kp,
-        "image_lengths": image_lengths if image_lengths is not None else (torch.full((B,), T_img or 1, dtype=torch.long, device=imgs.device if imgs is not None else labels.device)),
+        "image_lengths": image_lengths if image_lengths is not None else (
+            torch.full((B,), T_img or 1, dtype=torch.long, device=imgs.device if imgs is not None else labels.device)
+        ),
         "qgrid_lengths": qgrid_lengths,
         "labels": labels,
         "label_lengths": label_lengths,
@@ -119,7 +126,7 @@ def unpack_batch(batch: Any) -> Dict[str, Any]:
 
 
 def flatten_targets(labels: torch.Tensor, label_lengths: torch.Tensor) -> torch.Tensor:
-    outs: List[torch.Tensor] = []
+    outs = []
     for i in range(labels.size(0)):
         L = int(label_lengths[i].item())
         if L > 0:
@@ -141,10 +148,19 @@ def valid_ctc_targets(targets: torch.Tensor, num_classes: int, blank_idx: int) -
     return True
 
 
+def save_ckpt(state: Dict, out_dir: str, name: str):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, name)
+    torch.save(state, path)
+    if is_main_process():
+        print(f"[ckpt] saved -> {path}", flush=True)
+
+
 def train(args):
     device, local_rank = setup_ddp()
     torch.backends.cudnn.benchmark = True
 
+    # --- datasets ---
     train_set = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
@@ -186,6 +202,7 @@ def train(args):
         drop_last=False,
     )
 
+    # --- model ---
     model = MultiModalMamba(
         d_model=args.d_model,
         n_layer=args.n_layer,
@@ -203,21 +220,27 @@ def train(args):
     ctc_loss = nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # precision
     use_bf16 = args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else None
     if is_main_process():
         preflight_print(args.gloss_dict, shift_labels_by=0, num_classes=args.num_classes, blank_idx=blank_idx)
         if args.bf16 and not use_bf16:
-            print("[warn] --bf16 requested but not supported on this GPU/driver; training in fp32.", flush=True)
+            print("[warn] --bf16 requested but not supported; training in fp32.", flush=True)
 
-    step = 0
+    accum = max(1, int(args.accum))
+    global_step = 0
+    best_val = float("inf")
+
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         model.train()
+        optimizer.zero_grad(set_to_none=True)
         running = 0.0
         seen = 0
+
         for it, batch in enumerate(train_loader):
             batch = unpack_batch(batch)
             images = batch["images"].to(device, non_blocking=True) if batch["images"] is not None else None
@@ -228,7 +251,7 @@ def train(args):
             labels = batch["labels"].to(device, non_blocking=True)
 
             if use_bf16:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
                     log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T,B,V)
             else:
@@ -243,21 +266,25 @@ def train(args):
                 if is_main_process():
                     tmin = int(targets.min().item()) if targets.numel() else -1
                     tmax = int(targets.max().item()) if targets.numel() else -1
-                    print(f"[skip-batch] invalid targets (min={tmin}, max={tmax}, V={args.num_classes}); step={step} epoch={epoch} it={it}", flush=True)
+                    print(f"[skip-batch] invalid targets (min={tmin}, max={tmax}, V={args.num_classes}); step={global_step} epoch={epoch} it={it}", flush=True)
                 continue
 
             loss = ctc_loss(log_probs, targets, input_lengths, label_lengths)
+            (loss / accum).backward()
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            # step on accumulation boundary or at the very end
+            if (global_step + 1) % accum == 0 or (it + 1) == len(train_loader):
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             running += float(loss.item()) * B
             seen += B
-            step += 1
-            if is_main_process() and (it % args.log_interval == 0):
-                print(f"Epoch: [{epoch}]  [{it}/{len(train_loader)}]  lr: {args.lr:.6f}  loss: {running/ max(1,seen):.4f}", flush=True)
+            global_step += 1
 
+            if is_main_process() and (it % args.log_interval == 0):
+                print(f"Epoch: [{epoch}]  [{it}/{len(train_loader)}]  lr: {args.lr:.6f}  loss: {running/max(1,seen):.4f}  accum:{accum}", flush=True)
+
+        # ---- validation ----
         model.eval()
         val_loss = 0.0
         val_seen = 0
@@ -272,7 +299,7 @@ def train(args):
                 labels = batch["labels"].to(device, non_blocking=True)
 
                 if use_bf16:
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype):
                         logits = model(images, qgrids, keypoints, qgrid_lengths)
                         log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
                 else:
@@ -291,43 +318,66 @@ def train(args):
         if is_main_process():
             avg_train = running / max(1, seen)
             avg_val = val_loss / max(1, val_seen)
-            print(f"[epoch {epoch}] train_loss={avg_train:.4f}  val_loss={avg_val:.4f}", flush=True)
+            print(f"[epoch {epoch}] train_loss={avg_train:.4f}  val_loss={avg_val:.4f}  (accum={accum})", flush=True)
+
+            # save last + best
+            save_ckpt(
+                {"epoch": epoch, "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+                 "optimizer": optimizer.state_dict(),
+                 "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
+                args.out_dir, "last.pt",
+            )
+            if avg_val < best_val:
+                best_val = avg_val
+                save_ckpt(
+                    {"epoch": epoch, "model": (model.module.state_dict() if isinstance(model, DDP) else model.state_dict()),
+                     "optimizer": optimizer.state_dict(),
+                     "avg_train_loss": avg_train, "avg_val_loss": avg_val, "accum": accum},
+                    args.out_dir, "best.pt",
+                )
 
     cleanup_ddp()
 
 
 def get_args():
     p = argparse.ArgumentParser()
-    # data
+
+    # data (defaults from your note)
     p.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
     p.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
     p.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
     p.add_argument("--meta_dir",     required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
     p.add_argument("--gloss_dict",   required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
     p.add_argument("--out_dir",      default="checkpoints/multimodal_ddp")
-    # Model
+
+    # model
     p.add_argument("--d_model", type=int, default=512)
     p.add_argument("--n_layer", type=int, default=12)
     p.add_argument("--fusion_embed", type=int, default=512)
     p.add_argument("--fusion_heads", type=int, default=8)
     p.add_argument("--num_classes", type=int, default=1296)
-    p.add_argument("--max_kv", type=int, default=512)
+    p.add_argument("--max_kv", type=int, default=1024)
     p.add_argument("--pool_mode", type=str, default="mean", choices=["mean", "max", "vote"])
-    # Train
+
+    # training
     p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--log_interval", type=int, default=50)
-    # Precision
+    p.add_argument("--accum", type=int, default=1, help="gradient accumulation steps")
+
+    # precision
     p.add_argument("--bf16", action="store_true", help="enable autocast bfloat16 if supported")
+
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = get_args()
     train(args)
+
 
 
 
