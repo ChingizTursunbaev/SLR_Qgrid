@@ -1,13 +1,11 @@
 #!/usr/bin/env python
 # eval_multimodal.py — evaluation that matches ddp_train_multimodal packing/wrapping
-from pyexpat import model
-import argparse, warnings, math
-from typing import Dict, Any, Optional, List, Tuple
+import argparse, warnings
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # dataset / model
@@ -16,6 +14,7 @@ from slr.datasets.multi_modal_datasets import (
     multi_modal_collate_fn,
 )
 from slr.models.multi_modal_model import MultiModalMamba
+
 
 # -------------------------------
 # args – keep your same defaults
@@ -34,11 +33,11 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--bf16", action="store_true", help="Evaluate under bfloat16 autocast when supported")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--pool_mode", type=str, default="mean")  # just in case checkpoint stored this
+    p.add_argument("--pool_mode", type=str, default="mean")
     p.add_argument("--max_kv", type=int, default=2048)
-    # optional override (rarely needed now)
     p.add_argument("--force_num_classes", type=int, default=None)
     return p.parse_args()
+
 
 # -------------------------------
 # frame-encoder 5D wrapper (as in training)
@@ -71,6 +70,7 @@ def wrap_frame_encoder_for_5d(model: nn.Module, verbose: bool=True):
     if verbose:
         print("[patch] FrameEncoder adapted for 5D (B,T,C,H,W).", flush=True)
 
+
 # -------------------------------
 # id2gloss utilities
 # -------------------------------
@@ -85,7 +85,6 @@ def coerce_id_maps(gloss_dict_path: str) -> Tuple[Dict[str,int], Dict[int,str]]:
     id2gloss: Dict[int,str] = {}
 
     if isinstance(obj, dict):
-        # detect direction
         k0 = next(iter(obj.keys()))
         v0 = obj[k0]
         if isinstance(k0, str) and isinstance(v0, (int, np.integer)):
@@ -95,7 +94,6 @@ def coerce_id_maps(gloss_dict_path: str) -> Tuple[Dict[str,int], Dict[int,str]]:
             id2gloss = {int(k): str(v) for k, v in obj.items()}
             gloss2id = {v: k for k, v in id2gloss.items()}
         else:
-            # last resort: try to coerce both ways
             for k, v in obj.items():
                 try:
                     ik = int(k); sv = str(v)
@@ -107,30 +105,23 @@ def coerce_id_maps(gloss_dict_path: str) -> Tuple[Dict[str,int], Dict[int,str]]:
             if not gloss2id and id2gloss:
                 gloss2id = {g: i for i, g in id2gloss.items()}
     else:
-        # assume array/list of gloss strings indexed by id
         arr = list(obj)
         id2gloss = {i: str(g) for i, g in enumerate(arr)}
         gloss2id = {g: i for i, g in id2gloss.items()}
 
-    # ensure blank at 0; real labels should be >=1
     if 0 not in id2gloss:
         id2gloss[0] = "<blank>"
     if "<blank>" not in gloss2id:
         gloss2id["<blank>"] = 0
     return gloss2id, id2gloss
 
+
 def ensure_blank_zero_and_shift_if_needed(labels_sample: torch.Tensor,
                                           id2gloss: Dict[int,str]) -> Dict[int,str]:
-    """If labels appear to include 0 as a *real* label (not blank),
-       shift mapping so: 0=blank, real labels start at 1."""
     if labels_sample.numel() == 0:
-        # nothing to check
         return id2gloss
-    # Heuristic: if many labels are 0 but dataset does not intend blank inside targets,
-    # we consider 0 likely a real label and need a +1 shift.
     zero_frac = float((labels_sample == 0).float().mean().item())
     if zero_frac > 0.05 and id2gloss.get(0, "<blank>") != "<blank>":
-        # build shift
         shifted = {0: "<blank>"}
         for k, v in id2gloss.items():
             if k == 0: continue
@@ -138,22 +129,10 @@ def ensure_blank_zero_and_shift_if_needed(labels_sample: torch.Tensor,
         return shifted
     return id2gloss
 
+
 # -------------------------------
 # quick greedy collapse
 # -------------------------------
-def greedy_collapse_blank0(ids: List[int]) -> List[int]:
-    out = []
-    prev = None
-    for t in ids:
-        if t == 0:  # blank
-            prev = t
-            continue
-        if prev is not None and t == prev:
-            continue
-        out.append(t)
-        prev = t
-    return out
-
 def edit_distance(a: List[str], b: List[str]) -> int:
     m, n = len(a), len(b)
     dp = [[0]*(n+1) for _ in range(m+1)]
@@ -162,9 +141,9 @@ def edit_distance(a: List[str], b: List[str]) -> int:
     for i in range(1, m+1):
         ai = a[i-1]
         for j in range(1, n+1):
-            cost = 0 if ai == b[j-1] else 1
-            dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
+            dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1] + (ai != b[j-1]))
     return dp[m][n]
+
 
 # -------------------------------
 # evaluate loop (matches training packing)
@@ -176,24 +155,19 @@ def evaluate(model: nn.Module,
              device: torch.device,
              use_bf16: bool=False,
              force_blank_id: Optional[int]=None) -> Tuple[float,float,int,int,float]:
-    """
-    Returns: WER, CER, N, used_blank_id, blank_ratio
-    - Auto-detects blank id on a short warm-up if force_blank_id is None.
-    - If bf16 is on and blank_ratio > 95%, caller can retry in fp32.
-    """
+
     model.eval()
 
     # ----- warm-up to detect blank id -----
     blank_id = 0 if force_blank_id is None else int(force_blank_id)
     needs_auto_blank = force_blank_id is None
-    freq = None
 
-    warm_batches = 8  # use a few mini-batches to estimate; cheap and fast
+    warm_batches = 8
     checked = 0
     if needs_auto_blank:
-        freq = torch.zeros(next(iter(model.parameters())).dtype.__class__(1) == 1)  # dummy to keep type
-        # use a real tensor instead of the dtype trick:
-        freq = torch.zeros( max(id2gloss.keys())+1, dtype=torch.long )
+        # frequency over vocab size inferred from mapping
+        vocab_size = max(id2gloss.keys()) + 1 if id2gloss else 1
+        freq = torch.zeros(vocab_size, dtype=torch.long)
 
         autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
                         if (use_bf16 and device.type=="cuda" and torch.cuda.is_bf16_supported())
@@ -214,8 +188,9 @@ def evaluate(model: nn.Module,
 
         if checked > 0:
             blank_id = int(freq.argmax().item())
-            # tiny heuristic: if top-1 share is not dominant, keep 0
-            top_share = 100.0 * freq.max().item() / max(1, freq.sum().item())
+            total = int(freq.sum().item())
+            top = int(freq.max().item())
+            top_share = 100.0 * top / max(1, total)
             if top_share < 50.0:
                 blank_id = 0
             print(f"[auto] detected blank_id={blank_id} (top-share ~{top_share:.2f}%)", flush=True)
@@ -250,9 +225,9 @@ def evaluate(model: nn.Module,
             labels = labels.cpu()
             label_lengths = label_lengths.cpu()
 
-            B, T = pred.shape
+            B, _T = pred.shape
             for b in range(B):
-                # greedy collapse
+                # greedy collapse using detected blank_id
                 seq = []
                 prev = None
                 for t in pred[b].tolist():
@@ -265,13 +240,12 @@ def evaluate(model: nn.Module,
 
                 L = int(label_lengths[b].item())
                 ref_ids = labels[b, :L].tolist() if L>0 else []
-                # only strip the detected blank_id from refs (not hard-coded 0)
+                # strip only the detected blank index
                 ref_ids = [int(t) for t in ref_ids if int(t) != blank_id]
                 ref = " ".join(id2gloss.get(int(t), "<UNK>") for t in ref_ids)
 
-                # WER/CER
+                # WER
                 hw, rw = hyp.split(), ref.split()
-                # edit distance
                 m, n = len(hw), len(rw)
                 dp = [[0]*(n+1) for _ in range(m+1)]
                 for i in range(m+1): dp[i][0] = i
@@ -282,6 +256,7 @@ def evaluate(model: nn.Module,
                 total_w_edits += dp[m][n]
                 total_w_tok   += max(1, n)
 
+                # CER
                 hc, rc = list(hyp), list(ref)
                 mc, nc = len(hc), len(rc)
                 dp2 = [[0]*(nc+1) for _ in range(mc+1)]
@@ -344,7 +319,6 @@ def main():
     )
 
     # ---- vocab / classes ----
-    # prefer dataset's parsed maps, but coerce from file if missing
     try:
         gloss2id = getattr(ds, "gloss_dict")
         id2gloss = getattr(ds, "id_to_gloss")
@@ -353,11 +327,11 @@ def main():
     except Exception:
         gloss2id, id2gloss = coerce_id_maps(args.gloss_dict)
 
-    # sample some labels to verify id range and shift if needed
+    # quick sample to check ids; keep mapping as-is
     try:
         tmp_batch = next(iter(dl))
-        lbls = tmp_batch[3]  # labels (B,L)
-        lbl_lens = tmp_batch[5]  # label_lengths
+        lbls = tmp_batch[3]          # labels (B,L)
+        lbl_lens = tmp_batch[5]      # label_lengths
         sample = []
         for i in range(min(8, lbls.size(0))):
             L = int(lbl_lens[i].item())
@@ -369,7 +343,6 @@ def main():
 
     id2gloss = ensure_blank_zero_and_shift_if_needed(sample, id2gloss)
 
-    # ensure blank exists & compute num_classes
     if 0 not in id2gloss:
         id2gloss[0] = "<blank>"
     vocab_max = max(id2gloss.keys()) if id2gloss else 0
@@ -380,48 +353,47 @@ def main():
         print(f"[head] num_classes={num_classes} (from gloss_dict + blank)")
 
     # ---- model ----
-    # Try to infer architecture knobs from checkpoint when present
     ckpt = torch.load(args.ckpt, map_location="cpu")
-    # after: ckpt = torch.load(args.ckpt, map_location="cpu")
-    # pick the right dict
-    if isinstance(ckpt, dict):
-        sd = ckpt.get("state_dict") or ckpt.get("model") or ckpt.get("model_state") or ckpt
-    else:
+    sd = ckpt.get("state_dict") or ckpt.get("model") or ckpt.get("model_state") if isinstance(ckpt, dict) else ckpt
+    if sd is None:
         sd = ckpt
 
-    # --- infer dims from checkpoint ---
-    # img_proj.weight is [fusion_embed, d_model]
-    fe = sd["img_proj.weight"].shape[0]      # fusion_embed (should be 512)
-    dm = sd["img_proj.weight"].shape[1]      # d_model (should be 512)
-    # attn.in_proj_weight is [3*fe, fe] -> sanity
-    assert sd["attn.in_proj_weight"].shape[0] == 3 * fe
-    # classifier.weight is [num_classes, fe]
-    num_classes = sd["classifier.weight"].shape[0]
-
-    # heads don't affect parameter shapes; choose a clean divisor of fe
+    # infer dims from checkpoint
+    fe = sd["img_proj.weight"].shape[0]      # fusion_embed
+    dm = sd["img_proj.weight"].shape[1]      # d_model
     fusion_heads = 8 if fe % 8 == 0 else 4
 
-    print(f"[arch] inferred from ckpt -> d_model={dm}, fusion_embed={fe}, fusion_heads={fusion_heads}, num_classes={num_classes}")
+    # infer n_layer from keys if present
+    n_layer = None
+    try:
+        layer_ids = []
+        for k in sd.keys():
+            if "layers." in k:
+                try:
+                    layer_ids.append(int(k.split("layers.")[1].split(".")[0]))
+                except Exception:
+                    pass
+        if layer_ids:
+            n_layer = max(layer_ids) + 1
+            print(f"[arch] n_layer inferred from ckpt: {n_layer}")
+    except Exception:
+        pass
 
-    # --- now build the model with inferred sizes ---
+    print(f"[arch] inferred from ckpt -> d_model={dm}, fusion_embed={fe}, fusion_heads={fusion_heads}, num_classes={sd['classifier.weight'].shape[0]}")
+
     model = MultiModalMamba(
         d_model=dm,
-        n_layer=12,        # keep your previously inferred n_layer if you have it
+        n_layer=(n_layer or 12),
         fusion_embed=fe,
         fusion_heads=fusion_heads,
-        num_classes=num_classes,        # or use your id2gloss-derived count; both are 1296 here
+        num_classes=num_classes,   # keep dataset-derived classes (should match ckpt)
         max_kv=args.max_kv,
         pool_mode=args.pool_mode,
     ).to(device)
 
-    # keep your existing frame-encoder 5D wrapper here
     wrap_frame_encoder_for_5d(model, verbose=True)
 
-    # (optional) tiny dummy forward to materialize lazies, then load:
-    # ...
-
-
-    # materialize with a tiny forward to allocate shapes before load_state_dict
+    # materialize with a tiny forward before load
     try:
         b = next(iter(dl))
         images, qgrids, keypoints = b[0], b[1], b[2]
@@ -434,24 +406,15 @@ def main():
                 qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None,
             )
     except Exception:
-        # if it fails, we'll still proceed to load weights
         pass
 
-    # load checkpoint (strict, but report)
     print(f"[ckpt] loading: {args.ckpt}")
-    load = model.load_state_dict(sd, strict=True)  # strict can be True now; it should match
+    load = model.load_state_dict(sd, strict=True)
     unexpected = list(getattr(load, "unexpected_keys", []))
     missing    = list(getattr(load, "missing_keys", []))
     print(f"[ckpt] unexpected keys: {len(unexpected)}")
     print(f"[ckpt] missing keys: {len(missing)}")
 
-    # if classifier weights didn’t load, warn (WER likely bad)
-    cls_ok = not any(k.startswith("classifier") for k in missing)
-    if not cls_ok:
-        print("[warn] Classifier head did not fully load from checkpoint. "
-              "If vocab differs from training, WER/CER will be high.", flush=True)
-
-    # ---- evaluate ----
     use_bf16 = args.bf16 and (device.type == "cuda") and torch.cuda.is_bf16_supported()
     WER, CER, N, blank_id, blank_ratio = evaluate(model, dl, id2gloss, device, use_bf16=use_bf16)
     print(f"[RESULT] N={N}  WER={WER:.2f}%  CER={CER:.2f}%  (blank_id={blank_id}, blank@argmax={blank_ratio:.2f}%)")
