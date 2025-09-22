@@ -1,11 +1,12 @@
 # eval_multimodal.py
-# Uses your exact default paths and names; no guessing.
-# Adds a small adapter so frame_encoder can take (B,T,C,H,W).
+# Uses your exact path defaults + robust id2gloss loading from gloss_dict
+# Adds a small adapter so frame_encoder can take (B,T,C,H,W) -> (B,T,D)
 
 import argparse
 import warnings
 from typing import Dict, Any, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -71,6 +72,58 @@ def parse_args():
 
 
 # -------------------------------
+# id2gloss loader (robust)
+# -------------------------------
+def load_id2gloss(gloss_dict_path: str) -> Dict[int, str]:
+    """
+    Supports both:
+      - dict: {gloss(str) -> id(int)}  or  {id(int) -> gloss(str)}
+      - list/array: index -> gloss
+    Always returns a mapping {id(int) -> gloss(str)} and inserts id=0 as '<blank>'
+    if not present.
+    """
+    obj = np.load(gloss_dict_path, allow_pickle=True)
+    try:
+        obj = obj.item()  # if it's a dict saved via np.save
+    except Exception:
+        pass
+
+    id2gloss: Dict[int, str] = {}
+
+    if isinstance(obj, dict):
+        # Detect orientation
+        # Case A: keys are strings (gloss), values ints (id)
+        if obj and isinstance(next(iter(obj.keys())), str) and isinstance(next(iter(obj.values())), (int, np.integer)):
+            for g, i in obj.items():
+                id2gloss[int(i)] = str(g)
+        # Case B: keys are ints (id), values strings (gloss)
+        elif obj and isinstance(next(iter(obj.keys())), (int, np.integer)) and isinstance(next(iter(obj.values())), str):
+            for i, g in obj.items():
+                id2gloss[int(i)] = str(g)
+        else:
+            # Fallback: try to coerce
+            for k, v in obj.items():
+                try:
+                    i = int(k)
+                    g = str(v)
+                except Exception:
+                    i = int(v)
+                    g = str(k)
+                id2gloss[i] = g
+    else:
+        # Assume sequence-like container of gloss strings
+        arr = list(obj)
+        for i, g in enumerate(arr):
+            id2gloss[int(i)] = str(g)
+
+    # Ensure blank at index 0
+    if 0 not in id2gloss:
+        id2gloss[0] = "<blank>"
+
+    return id2gloss
+
+
+# -------------------------------
 # Evaluation
 # -------------------------------
 @torch.no_grad()
@@ -133,7 +186,6 @@ def evaluate(model: nn.Module,
         return edit_distance(a, b), len(b)
 
     for batch in dl:
-        # MultiModalPhoenixDataset should return a dict
         if not isinstance(batch, dict):
             raise RuntimeError("Expected dict batches from MultiModalPhoenixDataset.")
 
@@ -198,24 +250,24 @@ def main():
     map_location = torch.device(device)
 
     # Dataset — pass your args directly; note param names on ctor
+    # IMPORTANT: kp_path must point to the exact filename present on disk.
+    # If your file is the INTERPOLATED one, override via --kp_path.
     ds = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
         kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,         # <-- ctor expects meta_dir_path
-        gloss_dict_path=args.gloss_dict,     # <-- ctor expects gloss_dict_path
+        meta_dir_path=args.meta_dir,         # ctor expects meta_dir_path
+        gloss_dict_path=args.gloss_dict,     # ctor expects gloss_dict_path
         split=args.split,
     )
 
-    # id2gloss for decoding
+    # Build id2gloss:
     id2gloss = getattr(ds, "id2gloss", None)
-    if id2gloss is None:
-        gloss_list = getattr(ds, "gloss_list", None)
-        if isinstance(gloss_list, (list, tuple)):
-            id2gloss = {i: g for i, g in enumerate(gloss_list)}
-        else:
-            raise RuntimeError("Could not locate id2gloss mapping on dataset.")
+    if not isinstance(id2gloss, dict) or len(id2gloss) == 0:
+        # Load from gloss_dict file directly
+        id2gloss = load_id2gloss(args.gloss_dict)
 
+    # DataLoader (use dataset's collate if available)
     collate_fn = getattr(ds, "collate_fn", None)
     dl = DataLoader(
         ds,
