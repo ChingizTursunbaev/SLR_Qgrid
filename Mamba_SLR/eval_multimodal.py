@@ -5,12 +5,11 @@ import argparse
 import os
 import inspect
 import math
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
-# local imports
 from slr.datasets.multi_modal_datasets import (
     MultiModalPhoenixDataset,
     multi_modal_collate_fn,
@@ -22,14 +21,7 @@ from slr.models.multi_modal_model import MultiModalMamba
 # Gloss utilities
 # ----------------------------
 def load_id2gloss(gloss_path: str) -> List[str]:
-    """
-    Accepts:
-      - numpy scalar object containing dict(gloss->id) with ids 1..K
-      - numpy array/list of gloss strings (id->gloss)
-    Returns id2gloss list with id2gloss[0] = "<blank>" and len = max_id+1
-    """
     import numpy as np
-
     arr = np.load(gloss_path, allow_pickle=True)
     if getattr(arr, "shape", None) == () and getattr(arr, "dtype", None) == object:
         obj = arr.item()
@@ -45,7 +37,9 @@ def load_id2gloss(gloss_path: str) -> List[str]:
         return id2gloss
     elif isinstance(obj, (list, tuple)):
         id2gloss = [str(x) for x in obj]
-        if not id2gloss or id2gloss[0].lower() not in {"<blank>", "blank", "<pad>", ""}:
+        if not id2gloss:
+            raise AssertionError("empty gloss list")
+        if id2gloss[0].lower() not in {"<blank>", "blank", "<pad>", ""}:
             id2gloss[0] = "<blank>"
         return id2gloss
     else:
@@ -53,8 +47,35 @@ def load_id2gloss(gloss_path: str) -> List[str]:
 
 
 # ----------------------------
-# Decoding + metrics
+# Edit distance + metrics
 # ----------------------------
+def _lev(a: List[str], b: List[str]) -> int:
+    n, m = len(a), len(b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            cost = 0 if ai == b[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[n][m]
+
+
+def wer(ref: List[str], hyp: List[str]) -> float:
+    if len(ref) == 0:
+        return 0.0 if len(hyp) == 0 else 1.0
+    return _lev(ref, hyp) / len(ref)
+
+
+def cer(ref: str, hyp: str) -> float:
+    if len(ref) == 0:
+        return 0.0 if len(hyp) == 0 else 1.0
+    return _lev(list(ref), list(hyp)) / len(ref)
+
+
 def ctc_collapse_and_strip_blanks(ids: List[int], blank: int = 0) -> List[int]:
     out = []
     prev = None
@@ -67,56 +88,31 @@ def ctc_collapse_and_strip_blanks(ids: List[int], blank: int = 0) -> List[int]:
         prev = x
     return out
 
-def _lev(a: List[str], b: List[str]) -> int:
-    n, m = len(a), len(b)
-    dp = [[0]*(m+1) for _ in range(n+1)]
-    for i in range(n+1): dp[i][0] = i
-    for j in range(m+1): dp[0][j] = j
-    for i in range(1, n+1):
-        ai = a[i-1]
-        for j in range(1, m+1):
-            cost = 0 if ai == b[j-1] else 1
-            dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
-    return dp[n][m]
-
-def wer(ref: List[str], hyp: List[str]) -> float:
-    if len(ref) == 0:
-        return 0.0 if len(hyp) == 0 else 1.0
-    return _lev(ref, hyp) / len(ref)
-
-def cer(ref: str, hyp: str) -> float:
-    if len(ref) == 0:
-        return 0.0 if len(hyp) == 0 else 1.0
-    return _lev(list(ref), list(hyp)) / len(ref)
-
 
 # ----------------------------
-# Safe dataset construction
+# Dataset construction (signature-robust)
 # ----------------------------
 def make_dataset(split: str, args) -> MultiModalPhoenixDataset:
-    """
-    Pass only kwargs the current class supports, mapping names across branches:
-      meta_dir_path <-> meta_dir
-      gloss_dict_path <-> gloss_dict
-    """
     sig = inspect.signature(MultiModalPhoenixDataset.__init__)
     allowed = set(sig.parameters.keys())
 
-    # Base common fields
     kwargs = {}
-    if "split" in allowed:             kwargs["split"] = split
-    if "image_prefix" in allowed:      kwargs["image_prefix"] = args.image_prefix
-    if "qgrid_prefix" in allowed:      kwargs["qgrid_prefix"] = args.qgrid_prefix
+    if "split" in allowed:
+        kwargs["split"] = split
+    if "image_prefix" in allowed:
+        kwargs["image_prefix"] = args.image_prefix
+    if "qgrid_prefix" in allowed:
+        kwargs["qgrid_prefix"] = args.qgrid_prefix
     if "kp_path" in allowed and args.kp_path is not None:
         kwargs["kp_path"] = args.kp_path
 
-    # meta_dir path naming differences
+    # meta path
     if "meta_dir_path" in allowed:
         kwargs["meta_dir_path"] = args.meta_dir
     elif "meta_dir" in allowed:
         kwargs["meta_dir"] = args.meta_dir
 
-    # gloss dict path naming differences
+    # gloss dict path
     if "gloss_dict_path" in allowed:
         kwargs["gloss_dict_path"] = args.gloss_dict
     elif "gloss_dict" in allowed:
@@ -126,7 +122,7 @@ def make_dataset(split: str, args) -> MultiModalPhoenixDataset:
 
 
 # ----------------------------
-# Checkpoint utilities
+# Checkpoint helpers
 # ----------------------------
 def load_checkpoint(ckpt_path: str, map_location="cpu") -> Dict[str, torch.Tensor]:
     ckpt = torch.load(ckpt_path, map_location=map_location)
@@ -134,25 +130,63 @@ def load_checkpoint(ckpt_path: str, map_location="cpu") -> Dict[str, torch.Tenso
         return ckpt["model"]
     return ckpt
 
-def infer_num_classes_from_state(state_dict: Dict[str, torch.Tensor], fallback: int = 1296) -> int:
-    head_keys = [
+
+def find_head_class_sizes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    """
+    Return sizes for any recognized classifier-like heads found in the checkpoint.
+    """
+    head_names = [
         "classifier.weight",
-        "proj.weight",
         "head.weight",
-        "final.weight",
         "lm_head.weight",
         "output.weight",
+        "proj.weight",
+        "final.weight",
     ]
+    sizes = {}
     for k, v in state_dict.items():
-        if v is None or not torch.is_tensor(v): 
-            continue
-        if v.dim() == 2 and any(k.endswith(hk) for hk in head_keys):
-            return v.shape[0]
-    candidates = [(k, v.shape[0]) for k, v in state_dict.items() if torch.is_tensor(v) and v.dim() == 2]
-    if candidates:
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[0][1]
-    return fallback
+        if torch.is_tensor(v) and v.dim() == 2:
+            for hn in head_names:
+                if k.endswith(hn):
+                    sizes[hn] = v.shape[0]
+    return sizes
+
+
+def infer_num_classes(state_dict: Dict[str, torch.Tensor], gloss_len: int) -> Tuple[int, str]:
+    """
+    Prefer `classifier.weight`, else choose the LARGEST among other recognized heads,
+    else fall back to `gloss_len`.
+    Returns (num_classes, reason).
+    """
+    head_sizes = find_head_class_sizes(state_dict)
+    if "classifier.weight" in head_sizes:
+        return head_sizes["classifier.weight"], "ckpt(classifier.weight)"
+    if head_sizes:
+        # choose the largest among remaining heads
+        hn, sz = max(head_sizes.items(), key=lambda kv: kv[1])
+        return sz, f"ckpt({hn})"
+    return gloss_len, "gloss_dict_len"
+
+
+def load_weights_lenient(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
+    """
+    Try to load everything except the classifier if its shape mismatches.
+    """
+    own = model.state_dict()
+    compatible = {}
+    incompatible = []
+    for k, v in state_dict.items():
+        if k in own and torch.is_tensor(v) and own[k].shape == v.shape:
+            compatible[k] = v
+        else:
+            incompatible.append(k)
+    model.load_state_dict({**own, **compatible})
+    if incompatible:
+        print(f"[ckpt] skipped {len(incompatible)} incompatible keys (likely classifier):")
+        for k in incompatible[:8]:
+            print(f"        - {k}  {tuple(state_dict[k].shape) if torch.is_tensor(state_dict[k]) else 'obj'}")
+        if len(incompatible) > 8:
+            print(f"        ... (+{len(incompatible)-8} more)")
 
 
 # ----------------------------
@@ -166,7 +200,8 @@ def evaluate(model, dataloader, id2gloss: List[str], device: torch.device, use_b
     n_utts = 0
 
     autocast_ctx = (
-        torch.cuda.amp.autocast(dtype=torch.bfloat16) if use_bf16 and device.type == "cuda"
+        torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        if use_bf16 and device.type == "cuda"
         else torch.cuda.amp.autocast(enabled=False)
     )
 
@@ -179,10 +214,10 @@ def evaluate(model, dataloader, id2gloss: List[str], device: torch.device, use_b
             labels_list = batch.get("labels", None)
 
             with autocast_ctx:
-                logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B, T, C)
+                logits = model(images, qgrids, keypoints, qgrid_lengths)
                 if isinstance(logits, (tuple, list)):
                     logits = logits[0]
-                pred = logits.argmax(dim=-1)  # (B, T)
+                pred = logits.argmax(dim=-1)
 
             B = pred.size(0)
             for b in range(B):
@@ -208,6 +243,7 @@ def evaluate(model, dataloader, id2gloss: List[str], device: torch.device, use_b
 
 def main():
     p = argparse.ArgumentParser(description="Evaluate MultiModalMamba on PHOENIX14 with greedy CTC decode")
+
     # data (defaults set to your box)
     p.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
     p.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
@@ -229,7 +265,10 @@ def main():
     p.add_argument("--fusion_embed", type=int, default=512)
     p.add_argument("--fusion_heads", type=int, default=8)
     p.add_argument("--max_kv", type=int, default=1024)
-    p.add_argument("--pool_mode", default="mean", choices=["mean","max","vote"])
+    p.add_argument("--pool_mode", default="mean", choices=["mean", "max", "vote"])
+
+    # override hook
+    p.add_argument("--force_num_classes", type=int, default=None, help="override class count (else inferred from ckpt head, else gloss dict length)")
 
     args = p.parse_args()
 
@@ -237,7 +276,7 @@ def main():
     id2gloss = load_id2gloss(args.gloss_dict)
     print(f"[gloss] loaded {len(id2gloss)} entries; blank idx=0; sample: {id2gloss[:5]}")
 
-    # 2) dataset / loader (robust across branches)
+    # 2) dataset / loader
     ds = make_dataset(args.split, args)
     dl = DataLoader(
         ds,
@@ -250,9 +289,15 @@ def main():
 
     # 3) model from ckpt
     state = load_checkpoint(args.ckpt, map_location="cpu")
-    num_classes = infer_num_classes_from_state(state, fallback=len(id2gloss))
-    if num_classes != len(id2gloss):
-        print(f"[warn] ckpt head implies num_classes={num_classes}, but gloss dict len={len(id2gloss)}. Proceeding with ckpt value.")
+
+    if args.force_num_classes is not None:
+        num_classes = args.force_num_classes
+        reason = "forced"
+    else:
+        num_classes, reason = infer_num_classes(state, gloss_len=len(id2gloss))
+
+    print(f"[head] num_classes={num_classes} ({reason})")
+
     model = MultiModalMamba(
         d_model=args.d_model,
         n_layer=args.n_layer,
@@ -262,8 +307,17 @@ def main():
         max_kv=args.max_kv,
         pool_mode=args.pool_mode,
     )
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    print(f"[ckpt] loaded. missing={len(missing)} unexpected={len(unexpected)}")
+
+    # Try strict load; if mismatch, fall back to lenient load
+    try:
+        missing, unexpected = model.load_state_dict(state, strict=True)
+        # strict=True returns no missing/unexpected; if it does, treat as exception
+        if missing or unexpected:
+            raise RuntimeError("strict load produced missing/unexpected keys")
+        print("[ckpt] loaded strict.")
+    except Exception:
+        print("[ckpt] strict load failed -> loading non-head layers and reinitializing classifier")
+        load_weights_lenient(model, state)
 
     device = torch.device(args.device)
     model.to(device)
