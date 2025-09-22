@@ -358,8 +358,19 @@ def evaluate(model: nn.Module,
         keypoints = batch.get("keypoints")
         qgrid_lengths = batch["qgrid_lengths"]
 
-        y_ids = batch.get("gloss_ids") or batch.get("targets") or batch.get("labels")
-        y_text = batch.get("gloss_str") or batch.get("gloss") or batch.get("text")
+        # Safe picks that don't coerce tensors to bool
+        y_ids = batch.get("gloss_ids")
+        if y_ids is None:
+            y_ids = batch.get("targets")
+        if y_ids is None:
+            y_ids = batch.get("labels")
+
+        y_text = batch.get("gloss_str")
+        if y_text is None:
+            y_text = batch.get("gloss")
+        if y_text is None:
+            y_text = batch.get("text")
+
 
         images = images.to(device, non_blocking=True)
         qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
