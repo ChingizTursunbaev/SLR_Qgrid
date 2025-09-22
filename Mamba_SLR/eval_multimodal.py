@@ -114,7 +114,9 @@ def collate_mm(batch: List[Any]) -> Dict[str, Any]:
     # Compute each T_i from images
     Ts = []
     for s in batch_norm:
-        img = s.get("images") or s.get("frames")
+        img = s.get("images")
+        if img is None:
+            img = s.get("frames")
         if not isinstance(img, torch.Tensor):
             raise RuntimeError("Sample missing 'images' tensor")
         Ts.append(_infer_T_from_images(img))
@@ -131,7 +133,9 @@ def collate_mm(batch: List[Any]) -> Dict[str, Any]:
         lengths_list.append(Ts[i])
 
         # Qgrids: try to make time be dim 0 if 3D
-        qg = s.get("qgrids") or s.get("qgrid")
+        qg = s.get("qgrids")
+        if qg is None:
+            qg = s.get("qgrid")
         if isinstance(qg, torch.Tensor) and qg.ndim == 3:
             if qg.shape[0] == Ts[i]:
                 qgT = qg
@@ -146,7 +150,11 @@ def collate_mm(batch: List[Any]) -> Dict[str, Any]:
             qgrids_list.append(None)
 
         # Keypoints: usually (T,J,D)
-        kp = s.get("keypoints") or s.get("kps") or s.get("pose")
+        kp = s.get("keypoints")
+        if kp is None:
+            kp = s.get("kps")
+        if kp is None:
+            kp = s.get("pose")
         if isinstance(kp, torch.Tensor) and kp.ndim == 3 and kp.shape[0] == Ts[i]:
             kpT = _pad_time(kp, T_max, time_dim=0)
             keypts_list.append(kpT)
@@ -363,10 +371,11 @@ def evaluate(model: nn.Module,
         if not isinstance(batch, dict):
             raise RuntimeError("Expected dict batches from MultiModalPhoenixDataset.")
 
-        images = batch.get("images") or batch.get("frames")
-        qgrids = batch.get("qgrids") or batch.get("qgrid")
-        keypoints = batch.get("keypoints") or batch.get("kps") or batch.get("pose")
-        qgrid_lengths = batch.get("qgrid_lengths") or batch.get("qgrid_len") or batch.get("lengths")
+        images = batch["images"]
+        qgrids = batch.get("qgrids")
+        keypoints = batch.get("keypoints")
+        qgrid_lengths = batch["qgrid_lengths"]
+
 
         y_ids = batch.get("gloss_ids") or batch.get("targets") or batch.get("labels")
         y_text = batch.get("gloss_str") or batch.get("gloss") or batch.get("text")
