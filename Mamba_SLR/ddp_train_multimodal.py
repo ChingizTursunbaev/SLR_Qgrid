@@ -228,7 +228,15 @@ def train(args):
 
     model = base_model
     if torch.distributed.is_initialized():
-        model = DDP(base_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        model = DDP(
+            base_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,          # ✅ allow some params to skip grad
+            gradient_as_bucket_view=True,         # small perf/mem win
+            broadcast_buffers=False               # avoids buffer sync surprises
+        )
+
 
     blank_idx = 0
     ctc_loss = nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
