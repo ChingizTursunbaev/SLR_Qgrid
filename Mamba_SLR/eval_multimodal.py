@@ -14,6 +14,146 @@ from torch.utils.data import DataLoader
 from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset
 from slr.models.multi_modal_model import MultiModalMamba
 
+import torch
+import torch.nn as nn
+from typing import Dict, Any, Optional, List
+
+def _pad_time(x: torch.Tensor, T: int, time_dim: int) -> torch.Tensor:
+    """Pad tensor x on time_dim to length T with zeros (CPU tensor)."""
+    if x.shape[time_dim] == T:
+        return x
+    new_shape = list(x.shape)
+    new_shape[time_dim] = T
+    out = torch.zeros(new_shape, dtype=x.dtype)
+    # build a slice tuple like [:, :Ti, :, ...]
+    slc = [slice(None)] * x.ndim
+    slc[time_dim] = slice(0, x.shape[time_dim])
+    out[tuple(slc)] = x
+    return out
+
+def _infer_T_from_images(img: torch.Tensor) -> int:
+    """Infer time length from an image tensor (either (C,T,H,W) or (T,C,H,W))."""
+    if img.ndim != 4:
+        raise RuntimeError(f"Expected image tensor 4D, got {tuple(img.shape)}")
+    C_first = img.shape[0] in (1, 3)
+    if C_first:
+        return int(img.shape[1])   # (C, T, H, W)
+    else:
+        return int(img.shape[0])   # (T, C, H, W)
+
+def _to_TCHW(img: torch.Tensor) -> torch.Tensor:
+    """Return image tensor as (T, C, H, W) regardless of incoming layout."""
+    if img.ndim != 4:
+        raise RuntimeError(f"Expected image tensor 4D, got {tuple(img.shape)}")
+    if img.shape[0] in (1, 3):
+        # (C, T, H, W) -> (T, C, H, W)
+        return img.permute(1, 0, 2, 3).contiguous()
+    # already (T, C, H, W)
+    return img
+
+def collate_mm(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Pads variable-length time sequences in a batch.
+    Expects dict samples with keys: images (4D), qgrids (3D, optional), keypoints (3D, optional).
+    Returns:
+      images: (B, T, C, H, W)
+      qgrids: (B, T, ..., ...) if present
+      keypoints: (B, T, J, D) if present
+      qgrid_lengths: (B,) int
+      + any passthrough label fields stacked when possible
+    """
+    # 1) compute T_i per sample from images (most reliable)
+    Ts = []
+    for s in batch:
+        img = s.get("images") or s.get("frames")
+        if not isinstance(img, torch.Tensor):
+            raise RuntimeError("Sample missing 'images' tensor")
+        Ts.append(_infer_T_from_images(img))
+    T_max = max(Ts)
+
+    B = len(batch)
+    # prepare holders
+    images_list = []
+    qgrids_list = []   # optional
+    keypts_list = []   # optional
+    lengths_list = []
+
+    # 2) pad each field to T_max
+    for i, s in enumerate(batch):
+        # images -> (T, C, H, W) then pad
+        img = s.get("images") or s.get("frames")
+        img_TCHW = _to_TCHW(img)                           # (T_i, C, H, W)
+        img_TCHW = _pad_time(img_TCHW, T_max, time_dim=0)  # (T_max, C, H, W)
+        images_list.append(img_TCHW)
+        lengths_list.append(Ts[i])
+
+        # qgrids: assume (T, Hq, Wq) or (Hq, Wq, T); we’ll treat time as dim 0 if 3D
+        qg = s.get("qgrids") or s.get("qgrid")
+        if isinstance(qg, torch.Tensor):
+            if qg.ndim == 3:
+                # if time likely not dim 0, try to rotate if last dim is T_i
+                if qg.shape[0] == Ts[i]:
+                    qgT = qg
+                elif qg.shape[-1] == Ts[i]:
+                    qgT = qg.permute(2, 0, 1).contiguous()   # (T, Hq, Wq)
+                else:
+                    # fallback: assume first is time
+                    qgT = qg
+                qgT = _pad_time(qgT, T_max, time_dim=0)      # (T_max, Hq, Wq)
+            else:
+                # keep as-is if not 3D; or extend logic if you know its exact shape
+                qgT = qg
+            qgrids_list.append(qgT)
+        else:
+            qgrids_list.append(None)
+
+        # keypoints: usually (T, J, D)
+        kp = s.get("keypoints") or s.get("kps") or s.get("pose")
+        if isinstance(kp, torch.Tensor) and kp.ndim == 3 and kp.shape[0] == Ts[i]:
+            kpT = _pad_time(kp, T_max, time_dim=0)          # (T_max, J, D)
+            keypts_list.append(kpT)
+        else:
+            keypts_list.append(None)
+
+    # 3) stack along batch
+    images = torch.stack(images_list, dim=0)  # (B, T, C, H, W)
+    qgrids = None
+    if any(q is not None for q in qgrids_list):
+        # replace Nones with zeros
+        first = next(q for q in qgrids_list if q is not None)
+        filled = [ (q if q is not None else torch.zeros_like(first)) for q in qgrids_list ]
+        qgrids = torch.stack(filled, dim=0)   # (B, T, Hq, Wq) typically
+
+    keypoints = None
+    if any(k is not None for k in keypts_list):
+        first = next(k for k in keypts_list if k is not None)
+        filled = [ (k if k is not None else torch.zeros_like(first)) for k in keypts_list ]
+        keypoints = torch.stack(filled, dim=0)  # (B, T, J, D)
+
+    lengths = torch.tensor(lengths_list, dtype=torch.int32)  # (B,)
+
+    # 4) pass through label-ish fields if present (and stackable)
+    out: Dict[str, Any] = {
+        "images": images,                # (B, T, C, H, W)
+        "qgrids": qgrids,                # or None
+        "keypoints": keypoints,          # or None
+        "qgrid_lengths": lengths,        # important
+    }
+
+    # Try to collate common label fields if they look tensor-like lists
+    for k in ("gloss_ids", "targets", "labels", "gloss_str", "gloss", "text"):
+        vals = [s.get(k, None) for s in batch]
+        if all(v is None for v in vals):
+            continue
+        # If they are tensors with same shape, stack; else keep list
+        if all(isinstance(v, torch.Tensor) for v in vals):
+            try:
+                out[k] = torch.stack(vals, dim=0)
+            except Exception:
+                out[k] = vals
+        else:
+            out[k] = vals
+    return out
 
 # -------------------------------
 # Frame-encoder adapter
@@ -270,13 +410,14 @@ def main():
     # DataLoader (use dataset's collate if available)
     collate_fn = getattr(ds, "collate_fn", None)
     dl = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn if callable(collate_fn) else None,
+    ds,
+    batch_size=args.batch_size,
+    shuffle=False,
+    num_workers=args.num_workers,
+    pin_memory=True,
+    collate_fn=collate_mm,   # <— use our padding collate
     )
+
 
     # Model
     n_classes = args.force_num_classes or len(id2gloss)
