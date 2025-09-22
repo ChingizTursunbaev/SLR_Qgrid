@@ -225,7 +225,7 @@ def main():
 
     # model shape fallbacks
     p.add_argument("--d_model", type=int, default=512)
-    p.add_argument("--n_layer", type int, default=8)
+    p.add_argument("--n_layer", type=int, default=8)
     p.add_argument("--fusion_embed", type=int, default=512)
     p.add_argument("--fusion_heads", type=int, default=8)
     p.add_argument("--max_kv", type=int, default=1024)
