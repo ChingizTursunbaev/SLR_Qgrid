@@ -18,134 +18,167 @@ import torch
 import torch.nn as nn
 from typing import Dict, Any, Optional, List
 
+import torch
+from typing import Dict, Any, Optional, List, Tuple
+
 def _pad_time(x: torch.Tensor, T: int, time_dim: int) -> torch.Tensor:
-    """Pad tensor x on time_dim to length T with zeros (CPU tensor)."""
     if x.shape[time_dim] == T:
         return x
     new_shape = list(x.shape)
     new_shape[time_dim] = T
     out = torch.zeros(new_shape, dtype=x.dtype)
-    # build a slice tuple like [:, :Ti, :, ...]
     slc = [slice(None)] * x.ndim
     slc[time_dim] = slice(0, x.shape[time_dim])
     out[tuple(slc)] = x
     return out
 
-def _infer_T_from_images(img: torch.Tensor) -> int:
-    """Infer time length from an image tensor (either (C,T,H,W) or (T,C,H,W))."""
-    if img.ndim != 4:
-        raise RuntimeError(f"Expected image tensor 4D, got {tuple(img.shape)}")
-    C_first = img.shape[0] in (1, 3)
-    if C_first:
-        return int(img.shape[1])   # (C, T, H, W)
-    else:
-        return int(img.shape[0])   # (T, C, H, W)
-
 def _to_TCHW(img: torch.Tensor) -> torch.Tensor:
-    """Return image tensor as (T, C, H, W) regardless of incoming layout."""
+    # Accept (C,T,H,W) or (T,C,H,W) → return (T,C,H,W)
     if img.ndim != 4:
         raise RuntimeError(f"Expected image tensor 4D, got {tuple(img.shape)}")
-    if img.shape[0] in (1, 3):
-        # (C, T, H, W) -> (T, C, H, W)
+    if img.shape[0] in (1, 3):  # (C,T,H,W)
         return img.permute(1, 0, 2, 3).contiguous()
-    # already (T, C, H, W)
-    return img
+    return img  # already (T,C,H,W)
 
-def collate_mm(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _infer_T_from_images(img: torch.Tensor) -> int:
+    # Works for (C,T,H,W) or (T,C,H,W)
+    if img.ndim != 4:
+        raise RuntimeError(f"Expected image tensor 4D, got {tuple(img.shape)}")
+    if img.shape[0] in (1, 3):  # (C,T,H,W)
+        return int(img.shape[1])
+    return int(img.shape[0])     # (T,C,H,W)
+
+def _sample_to_dict(sample: Any) -> Dict[str, Any]:
     """
-    Pads variable-length time sequences in a batch.
-    Expects dict samples with keys: images (4D), qgrids (3D, optional), keypoints (3D, optional).
+    Normalize a dataset sample (dict OR tuple/list) into a dict with:
+      images (4D), qgrids (3D optional), keypoints (3D optional),
+      qgrid_lengths (int/1D optional), gloss_ids/gloss_str/labels (optional)
+    """
+    if isinstance(sample, dict):
+        return sample
+
+    if not isinstance(sample, (tuple, list)):
+        raise RuntimeError(f"Unexpected sample type: {type(sample)}")
+
+    out: Dict[str, Any] = {}
+    others: List[Any] = []
+
+    for x in sample:
+        if isinstance(x, torch.Tensor):
+            if x.ndim == 4 and 'images' not in out:
+                out['images'] = x  # (C,T,H,W) or (T,C,H,W)
+                continue
+            if x.ndim == 3:
+                # Heuristic: keypoints typically (T,J,D) with small D (2/3/4/6)
+                # If last dim small (<=6) and middle reasonably large, call it keypoints
+                if x.shape[-1] in (2, 3, 4, 6) and x.shape[1] >= 8 and 'keypoints' not in out:
+                    out['keypoints'] = x
+                elif 'qgrids' not in out:
+                    out['qgrids'] = x  # assume (T,Hq,Wq) or (Hq,Wq,T)
+                else:
+                    others.append(x)
+                continue
+            if x.ndim == 1 and 'qgrid_lengths' not in out and x.numel() == 1:
+                out['qgrid_lengths'] = x  # scalar len as 1D
+                continue
+        # non-tensor or unclassified → keep
+        others.append(x)
+
+    # Try to attach common label-ish fields from leftovers
+    # e.g., a tensor of ids, or list/str tokens
+    for x in others:
+        if isinstance(x, torch.Tensor) and x.ndim == 1 and 'gloss_ids' not in out:
+            out['gloss_ids'] = x
+        elif isinstance(x, (list, tuple)) and 'gloss_str' not in out:
+            out['gloss_str'] = list(x)
+        elif isinstance(x, str) and 'gloss_str' not in out:
+            out['gloss_str'] = x
+
+    if 'images' not in out:
+        raise RuntimeError("Sample has no images tensor (4D)")
+
+    return out
+
+def collate_mm(batch: List[Any]) -> Dict[str, Any]:
+    """
+    Pads variable-length time across a batch.
     Returns:
-      images: (B, T, C, H, W)
-      qgrids: (B, T, ..., ...) if present
-      keypoints: (B, T, J, D) if present
-      qgrid_lengths: (B,) int
-      + any passthrough label fields stacked when possible
+      images: (B,T,C,H,W)
+      qgrids: (B,T,...) or None
+      keypoints: (B,T,J,D) or None
+      qgrid_lengths: (B,)
+      labels (gloss_ids/gloss_str) if present
     """
-    # 1) compute T_i per sample from images (most reliable)
+    batch_norm = [_sample_to_dict(s) for s in batch]
+
+    # Compute each T_i from images
     Ts = []
-    for s in batch:
+    for s in batch_norm:
         img = s.get("images") or s.get("frames")
         if not isinstance(img, torch.Tensor):
             raise RuntimeError("Sample missing 'images' tensor")
         Ts.append(_infer_T_from_images(img))
     T_max = max(Ts)
 
-    B = len(batch)
-    # prepare holders
-    images_list = []
-    qgrids_list = []   # optional
-    keypts_list = []   # optional
-    lengths_list = []
+    images_list, qgrids_list, keypts_list, lengths_list = [], [], [], []
 
-    # 2) pad each field to T_max
-    for i, s in enumerate(batch):
-        # images -> (T, C, H, W) then pad
+    for i, s in enumerate(batch_norm):
+        # Images → (T,C,H,W) then pad
         img = s.get("images") or s.get("frames")
-        img_TCHW = _to_TCHW(img)                           # (T_i, C, H, W)
-        img_TCHW = _pad_time(img_TCHW, T_max, time_dim=0)  # (T_max, C, H, W)
+        img_TCHW = _to_TCHW(img)
+        img_TCHW = _pad_time(img_TCHW, T_max, time_dim=0)
         images_list.append(img_TCHW)
         lengths_list.append(Ts[i])
 
-        # qgrids: assume (T, Hq, Wq) or (Hq, Wq, T); we’ll treat time as dim 0 if 3D
+        # Qgrids: try to make time be dim 0 if 3D
         qg = s.get("qgrids") or s.get("qgrid")
-        if isinstance(qg, torch.Tensor):
-            if qg.ndim == 3:
-                # if time likely not dim 0, try to rotate if last dim is T_i
-                if qg.shape[0] == Ts[i]:
-                    qgT = qg
-                elif qg.shape[-1] == Ts[i]:
-                    qgT = qg.permute(2, 0, 1).contiguous()   # (T, Hq, Wq)
-                else:
-                    # fallback: assume first is time
-                    qgT = qg
-                qgT = _pad_time(qgT, T_max, time_dim=0)      # (T_max, Hq, Wq)
-            else:
-                # keep as-is if not 3D; or extend logic if you know its exact shape
+        if isinstance(qg, torch.Tensor) and qg.ndim == 3:
+            if qg.shape[0] == Ts[i]:
                 qgT = qg
+            elif qg.shape[-1] == Ts[i]:
+                qgT = qg.permute(2, 0, 1).contiguous()
+            else:
+                # fallback: assume first is time
+                qgT = qg
+            qgT = _pad_time(qgT, T_max, time_dim=0)
             qgrids_list.append(qgT)
         else:
             qgrids_list.append(None)
 
-        # keypoints: usually (T, J, D)
+        # Keypoints: usually (T,J,D)
         kp = s.get("keypoints") or s.get("kps") or s.get("pose")
         if isinstance(kp, torch.Tensor) and kp.ndim == 3 and kp.shape[0] == Ts[i]:
-            kpT = _pad_time(kp, T_max, time_dim=0)          # (T_max, J, D)
+            kpT = _pad_time(kp, T_max, time_dim=0)
             keypts_list.append(kpT)
         else:
             keypts_list.append(None)
 
-    # 3) stack along batch
-    images = torch.stack(images_list, dim=0)  # (B, T, C, H, W)
+    images = torch.stack(images_list, dim=0)       # (B,T,C,H,W)
     qgrids = None
     if any(q is not None for q in qgrids_list):
-        # replace Nones with zeros
         first = next(q for q in qgrids_list if q is not None)
-        filled = [ (q if q is not None else torch.zeros_like(first)) for q in qgrids_list ]
-        qgrids = torch.stack(filled, dim=0)   # (B, T, Hq, Wq) typically
+        filled = [(q if q is not None else torch.zeros_like(first)) for q in qgrids_list]
+        qgrids = torch.stack(filled, dim=0)        # (B,T,Hq,Wq)
 
     keypoints = None
     if any(k is not None for k in keypts_list):
         first = next(k for k in keypts_list if k is not None)
-        filled = [ (k if k is not None else torch.zeros_like(first)) for k in keypts_list ]
-        keypoints = torch.stack(filled, dim=0)  # (B, T, J, D)
+        filled = [(k if k is not None else torch.zeros_like(first)) for k in keypts_list]
+        keypoints = torch.stack(filled, dim=0)     # (B,T,J,D)
 
     lengths = torch.tensor(lengths_list, dtype=torch.int32)  # (B,)
 
-    # 4) pass through label-ish fields if present (and stackable)
+    # Labels: try to collate if present & stackable
     out: Dict[str, Any] = {
-        "images": images,                # (B, T, C, H, W)
-        "qgrids": qgrids,                # or None
-        "keypoints": keypoints,          # or None
-        "qgrid_lengths": lengths,        # important
+        "images": images,
+        "qgrids": qgrids,
+        "keypoints": keypoints,
+        "qgrid_lengths": lengths,
     }
-
-    # Try to collate common label fields if they look tensor-like lists
     for k in ("gloss_ids", "targets", "labels", "gloss_str", "gloss", "text"):
-        vals = [s.get(k, None) for s in batch]
+        vals = [s.get(k, None) for s in batch_norm]
         if all(v is None for v in vals):
             continue
-        # If they are tensors with same shape, stack; else keep list
         if all(isinstance(v, torch.Tensor) for v in vals):
             try:
                 out[k] = torch.stack(vals, dim=0)
@@ -154,6 +187,7 @@ def collate_mm(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             out[k] = vals
     return out
+
 
 # -------------------------------
 # Frame-encoder adapter
@@ -415,8 +449,9 @@ def main():
     shuffle=False,
     num_workers=args.num_workers,
     pin_memory=True,
-    collate_fn=collate_mm,   # <— use our padding collate
+    collate_fn=collate_mm,   # <- use our robust collate
     )
+
 
 
     # Model
