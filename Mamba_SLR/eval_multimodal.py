@@ -317,39 +317,44 @@ def main():
     # ---- model ----
     # Try to infer architecture knobs from checkpoint when present
     ckpt = torch.load(args.ckpt, map_location="cpu")
+    # after: ckpt = torch.load(args.ckpt, map_location="cpu")
+    # pick the right dict
     if isinstance(ckpt, dict):
         sd = ckpt.get("state_dict") or ckpt.get("model") or ckpt.get("model_state") or ckpt
     else:
         sd = ckpt
 
-    # infer n_layer when possible (based on keys)
-    n_layer = None
-    try:
-        layer_ids = []
-        for k in sd.keys():
-            if "layers." in k:
-                try:
-                    li = int(k.split("layers.")[1].split(".")[0])
-                    layer_ids.append(li)
-                except Exception:
-                    pass
-        if layer_ids:
-            n_layer = max(layer_ids) + 1
-            print(f"[arch] n_layer inferred from ckpt: {n_layer}")
-    except Exception:
-        pass
+    # --- infer dims from checkpoint ---
+    # img_proj.weight is [fusion_embed, d_model]
+    fe = sd["img_proj.weight"].shape[0]      # fusion_embed (should be 512)
+    dm = sd["img_proj.weight"].shape[1]      # d_model (should be 512)
+    # attn.in_proj_weight is [3*fe, fe] -> sanity
+    assert sd["attn.in_proj_weight"].shape[0] == 3 * fe
+    # classifier.weight is [num_classes, fe]
+    num_classes = sd["classifier.weight"].shape[0]
 
+    # heads don't affect parameter shapes; choose a clean divisor of fe
+    fusion_heads = 8 if fe % 8 == 0 else 4
+
+    print(f"[arch] inferred from ckpt -> d_model={dm}, fusion_embed={fe}, fusion_heads={fusion_heads}, num_classes={num_classes}")
+
+    # --- now build the model with inferred sizes ---
     model = MultiModalMamba(
-        d_model=512,                   # defaults are harmless; weights will populate
-        n_layer=(n_layer or 12),
-        fusion_embed=256,
-        fusion_heads=4,
-        num_classes=num_classes,
+        d_model=dm,
+        n_layer=(n_layer or 12),        # keep your previously inferred n_layer if you have it
+        fusion_embed=fe,
+        fusion_heads=fusion_heads,
+        num_classes=num_classes,        # or use your id2gloss-derived count; both are 1296 here
         max_kv=args.max_kv,
         pool_mode=args.pool_mode,
     ).to(device)
 
+    # keep your existing frame-encoder 5D wrapper here
     wrap_frame_encoder_for_5d(model, verbose=True)
+
+    # (optional) tiny dummy forward to materialize lazies, then load:
+    # ...
+
 
     # materialize with a tiny forward to allocate shapes before load_state_dict
     try:
@@ -369,7 +374,7 @@ def main():
 
     # load checkpoint (strict, but report)
     print(f"[ckpt] loading: {args.ckpt}")
-    load = model.load_state_dict(sd, strict=False)
+    load = model.load_state_dict(sd, strict=True)  # strict can be True now; it should match
     unexpected = list(getattr(load, "unexpected_keys", []))
     missing    = list(getattr(load, "missing_keys", []))
     print(f"[ckpt] unexpected keys: {len(unexpected)}")
