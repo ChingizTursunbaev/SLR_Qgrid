@@ -184,9 +184,29 @@ def main():
     print(f"[head] num_classes={num_classes} (from gloss_dict + blank)")
 
     # Build model w/ same defaults as training script
-    model = MultiModalMamba(num_classes=num_classes, max_kv=args.max_kv)  # :contentReference[oaicite:7]{index=7}
-    model.frame_encoder = FrameEncoder5D(model.frame_encoder)             # (B,T,C,H,W)->(B,T,D) :contentReference[oaicite:8]{index=8}
-    model = model.to(device)
+    model = MultiModalMamba(num_classes=num_classes, max_kv=args.max_kv).to(device)
+
+    # ✅ in-place forward patch (keeps module name 'frame_encoder' so ckpt keys match)
+    import types
+    _fe_orig_forward = model.frame_encoder.forward
+
+    def _fe_forward_5d(x, *a, **kw):
+        if x.dim() == 5:  # (B,T,C,H,W) -> (B*T,C,H,W)
+            B, T, C, H, W = x.shape
+            y = _fe_orig_forward(x.reshape(B*T, C, H, W), *a, **kw)
+            if y.dim() == 2:    # (B*T, D)
+                return y.view(B, T, -1)
+            if y.dim() == 3:    # (B*T, P, D) -> average patches
+                return y.mean(dim=1).view(B, T, -1)
+            raise RuntimeError(f"Unexpected frame_encoder output {tuple(y.shape)}")
+        elif x.dim() == 4:
+            return _fe_orig_forward(x, *a, **kw)  # (B*T,C,H,W)
+        else:
+            raise RuntimeError(f"frame_encoder expected 4D/5D, got {tuple(x.shape)}")
+
+    # bind the method to the instance
+    model.frame_encoder.forward = types.MethodType(_fe_forward_5d, model.frame_encoder)
+
 
     # -------- 1) Materialize LazyLinear with a dummy forward BEFORE loading --------
     try:
@@ -225,8 +245,15 @@ def main():
     ld = model.load_state_dict(sd, strict=False)
     missing = list(getattr(ld, "missing_keys", []))
     unexpected = list(getattr(ld, "unexpected_keys", []))
-    if unexpected: print(f"[ckpt] unexpected keys: {len(unexpected)}")
-    if missing:    print(f"[ckpt] missing keys: {len(missing)}")
+    print(f"[ckpt] unexpected keys: {len(unexpected)}")
+    print(f"[ckpt] missing keys: {len(missing)}")
+    if unexpected[:5]: print("[ckpt] unexpected sample:", unexpected[:5])
+    if missing[:5]:    print("[ckpt] missing sample:", missing[:5])
+
+    # missing = list(getattr(ld, "missing_keys", []))
+    # unexpected = list(getattr(ld, "unexpected_keys", []))
+    # if unexpected: print(f"[ckpt] unexpected keys: {len(unexpected)}")
+    # if missing:    print(f"[ckpt] missing keys: {len(missing)}")
 
     # Warn if head still didn’t load
     if ("classifier.weight" in missing) or ("classifier.bias" in missing):
