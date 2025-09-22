@@ -5,7 +5,7 @@ import argparse
 import os
 import inspect
 import math
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
@@ -132,9 +132,6 @@ def load_checkpoint(ckpt_path: str, map_location="cpu") -> Dict[str, torch.Tenso
 
 
 def find_head_class_sizes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, int]:
-    """
-    Return sizes for any recognized classifier-like heads found in the checkpoint.
-    """
     head_names = [
         "classifier.weight",
         "head.weight",
@@ -153,25 +150,16 @@ def find_head_class_sizes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, int]
 
 
 def infer_num_classes(state_dict: Dict[str, torch.Tensor], gloss_len: int) -> Tuple[int, str]:
-    """
-    Prefer `classifier.weight`, else choose the LARGEST among other recognized heads,
-    else fall back to `gloss_len`.
-    Returns (num_classes, reason).
-    """
     head_sizes = find_head_class_sizes(state_dict)
     if "classifier.weight" in head_sizes:
         return head_sizes["classifier.weight"], "ckpt(classifier.weight)"
     if head_sizes:
-        # choose the largest among remaining heads
         hn, sz = max(head_sizes.items(), key=lambda kv: kv[1])
         return sz, f"ckpt({hn})"
     return gloss_len, "gloss_dict_len"
 
 
 def load_weights_lenient(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]) -> None:
-    """
-    Try to load everything except the classifier if its shape mismatches.
-    """
     own = model.state_dict()
     compatible = {}
     incompatible = []
@@ -182,11 +170,33 @@ def load_weights_lenient(model: torch.nn.Module, state_dict: Dict[str, torch.Ten
             incompatible.append(k)
     model.load_state_dict({**own, **compatible})
     if incompatible:
-        print(f"[ckpt] skipped {len(incompatible)} incompatible keys (likely classifier):")
+        print(f"[ckpt] skipped {len(incompatible)} incompatible keys (likely classifier or arch diff):")
         for k in incompatible[:8]:
-            print(f"        - {k}  {tuple(state_dict[k].shape) if torch.is_tensor(state_dict[k]) else 'obj'}")
+            shp = tuple(state_dict[k].shape) if torch.is_tensor(state_dict[k]) else "obj"
+            print(f"        - {k}  {shp}")
         if len(incompatible) > 8:
             print(f"        ... (+{len(incompatible)-8} more)")
+
+
+# ----------------------------
+# Batch normalization (robust to list/tuple)
+# ----------------------------
+def normalize_batch(batch: Union[dict, list, tuple]) -> dict:
+    """
+    Ensure we always end up with a dict like training:
+      keys: images, qgrids, keypoints, qgrid_lengths, labels (optional)
+    """
+    if isinstance(batch, dict):
+        return batch
+    if isinstance(batch, (list, tuple)):
+        # common cases:
+        # 1) [ {sample1}, {sample2}, ... ]  -> fold with our collate
+        if len(batch) > 0 and all(isinstance(b, dict) for b in batch):
+            return multi_modal_collate_fn(batch)
+        # 2) [ {batched_dict} ] -> unwrap
+        if len(batch) == 1 and isinstance(batch[0], dict):
+            return batch[0]
+    raise TypeError(f"Unexpected batch type: {type(batch)}")
 
 
 # ----------------------------
@@ -200,13 +210,15 @@ def evaluate(model, dataloader, id2gloss: List[str], device: torch.device, use_b
     n_utts = 0
 
     autocast_ctx = (
-        torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        torch.amp.autocast("cuda", dtype=torch.bfloat16)
         if use_bf16 and device.type == "cuda"
-        else torch.cuda.amp.autocast(enabled=False)
+        else torch.amp.autocast("cuda", enabled=False)
     )
 
     with torch.no_grad():
-        for batch in dataloader:
+        for raw_batch in dataloader:
+            batch = normalize_batch(raw_batch)
+
             images = batch["images"].to(device, non_blocking=True)
             qgrids = batch["qgrids"].to(device, non_blocking=True)
             keypoints = batch["keypoints"].to(device, non_blocking=True)
@@ -230,6 +242,7 @@ def evaluate(model, dataloader, id2gloss: List[str], device: torch.device, use_b
                     ref_ids = labels_list[b].tolist()
                     ref_tokens = [id2gloss[i] if 0 <= i < len(id2gloss) else f"<oob:{i}>" for i in ref_ids]
                 else:
+                    # if eval split has no labels, skip metrics accumulation
                     continue
 
                 total_wer += wer(ref_tokens, hyp_tokens)
@@ -284,7 +297,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=multi_modal_collate_fn,
+        collate_fn=multi_modal_collate_fn,  # even if this is bypassed, normalize_batch() will recover
     )
 
     # 3) model from ckpt
@@ -311,7 +324,6 @@ def main():
     # Try strict load; if mismatch, fall back to lenient load
     try:
         missing, unexpected = model.load_state_dict(state, strict=True)
-        # strict=True returns no missing/unexpected; if it does, treat as exception
         if missing or unexpected:
             raise RuntimeError("strict load produced missing/unexpected keys")
         print("[ckpt] loaded strict.")
