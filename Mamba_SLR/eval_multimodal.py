@@ -341,7 +341,7 @@ def main():
     # --- now build the model with inferred sizes ---
     model = MultiModalMamba(
         d_model=dm,
-        n_layer=(n_layer or 12),        # keep your previously inferred n_layer if you have it
+        n_layer=12,        # keep your previously inferred n_layer if you have it
         fusion_embed=fe,
         fusion_heads=fusion_heads,
         num_classes=num_classes,        # or use your id2gloss-derived count; both are 1296 here
