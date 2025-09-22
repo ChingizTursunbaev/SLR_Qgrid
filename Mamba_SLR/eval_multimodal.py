@@ -190,22 +190,20 @@ def main():
     import types
     _fe_orig_forward = model.frame_encoder.forward
 
-    def _fe_forward_5d(x, *a, **kw):
-        if x.dim() == 5:  # (B,T,C,H,W) -> (B*T,C,H,W)
+    def _fe_forward_5d(self, x, *a, **kw):   # ← add self here
+        if x.dim() == 5:                     # (B,T,C,H,W)
             B, T, C, H, W = x.shape
             y = _fe_orig_forward(x.reshape(B*T, C, H, W), *a, **kw)
-            if y.dim() == 2:    # (B*T, D)
-                return y.view(B, T, -1)
-            if y.dim() == 3:    # (B*T, P, D) -> average patches
-                return y.mean(dim=1).view(B, T, -1)
+            if y.dim() == 2:  return y.view(B, T, -1)
+            if y.dim() == 3:  return y.mean(dim=1).view(B, T, -1)
             raise RuntimeError(f"Unexpected frame_encoder output {tuple(y.shape)}")
-        elif x.dim() == 4:
-            return _fe_orig_forward(x, *a, **kw)  # (B*T,C,H,W)
+        elif x.dim() == 4:                   # (B*T,C,H,W)
+            return _fe_orig_forward(x, *a, **kw)
         else:
             raise RuntimeError(f"frame_encoder expected 4D/5D, got {tuple(x.shape)}")
 
-    # bind the method to the instance
     model.frame_encoder.forward = types.MethodType(_fe_forward_5d, model.frame_encoder)
+
 
 
     # -------- 1) Materialize LazyLinear with a dummy forward BEFORE loading --------
