@@ -1,27 +1,26 @@
 # eval_multimodal.py
-# Final: robust dataset args + frame-encoder adapter for (B,T,C,H,W)
+# Uses your exact default paths and names; no guessing.
+# Adds a small adapter so frame_encoder can take (B,T,C,H,W).
 
-import os
 import argparse
 import warnings
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# --- repo imports (keep as-is for your tree) ---
 from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset
 from slr.models.multi_modal_model import MultiModalMamba
 
 
-# ==========================
-# Frame-Encoder Adapter
-# ==========================
+# -------------------------------
+# Frame-encoder adapter
+# -------------------------------
 class _FrameEncoderAdapter(nn.Module):
     """
-    Wraps the existing frame_encoder so it can take (B, T, C, H, W)
-    and returns (B, T, D). If given (B*T, C, H, W), passes through.
+    Makes an encoder that expects (B*T, C, H, W) work with (B, T, C, H, W).
+    Returns (B, T, D). If input is already (B*T, C, H, W), passes through.
     """
     def __init__(self, enc: nn.Module):
         super().__init__()
@@ -29,144 +28,51 @@ class _FrameEncoderAdapter(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 4:
-            # Already (B*T, C, H, W)
-            return self._normalize_output(self.enc(x), B=None, T=None)
-
+            # already (B*T, C, H, W)
+            return self._normalize(self.enc(x), B=None, T=None)
         if x.dim() != 5:
-            raise RuntimeError(f"[adapter] Expected (B,T,C,H,W) or (B*T,C,H,W); got {tuple(x.shape)}")
-
+            raise RuntimeError(f"[adapter] expected 5D (B,T,C,H,W) or 4D (B*T,C,H,W), got {tuple(x.shape)}")
         B, T, C, H, W = x.shape
-        x_bt = x.reshape(B * T, C, H, W)   # (B*T, C, H, W)
-        y = self.enc(x_bt)                 # typically (B*T, D) or (B*T, P, D)
-        return self._normalize_output(y, B=B, T=T)
+        x_bt = x.reshape(B * T, C, H, W)
+        y = self.enc(x_bt)  # (B*T, D) or (B*T, P, D)
+        return self._normalize(y, B, T)
 
     @staticmethod
-    def _normalize_output(y: torch.Tensor, B: Optional[int], T: Optional[int]) -> torch.Tensor:
-        # Normalize to (B, T, D) when B/T provided, else return as-is.
+    def _normalize(y: torch.Tensor, B: Optional[int], T: Optional[int]) -> torch.Tensor:
         if B is None or T is None:
             return y
-        if y.dim() == 2:
-            return y.view(B, T, -1)               # (B*T, D) -> (B, T, D)
-        if y.dim() == 3:
-            # (B*T, P, D) -> mean pool patches -> (B, T, D)
+        if y.dim() == 2:       # (B*T, D)
+            return y.view(B, T, -1)
+        if y.dim() == 3:       # (B*T, P, D) -> mean pool patches
             y = y.mean(dim=1)
             return y.view(B, T, -1)
-        raise RuntimeError(f"[adapter] Unexpected frame_encoder output shape {tuple(y.shape)}")
+        raise RuntimeError(f"[adapter] unexpected frame_encoder output {tuple(y.shape)}")
 
 
-# ==========================
-# Utils: path guessing
-# ==========================
-def _first_existing(candidates: List[str]) -> Optional[str]:
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-    return None
-
-def _repo_root() -> str:
-    return os.path.abspath(os.path.dirname(__file__))
-
-def guess_phoenix_paths() -> Tuple[str, str, str, str, str]:
-    """
-    Try to guess dataset paths from common layouts and your earlier logs.
-    You can still override via CLI flags or env vars.
-    """
-    root = _repo_root()
-    base_candidates = [
-        os.path.join(root, "data", "phoenix2014"),
-        "/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014",  # your machine's path seen in logs
-        os.path.join(root, "phoenix2014"),
-    ]
-    base = _first_existing(base_candidates) or base_candidates[0]
-
-    # frames
-    image_prefix = _first_existing([
-        os.path.join(base, "phoenix2014-frames"),
-        os.path.join(base, "frames"),
-        os.path.join(base, "images"),
-    ]) or os.path.join(base, "frames")
-
-    # qgrid
-    qgrid_prefix = _first_existing([
-        os.path.join(base, "qgrid"),
-        os.path.join(base, "qgrids"),
-        os.path.join(base, "qgrid_npz"),
-    ]) or os.path.join(base, "qgrid")
-
-    # keypoints .pkl
-    kp_path = _first_existing([
-        os.path.join(base, "phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256_INTERPOLATED.pkl"),
-        os.path.join(base, "phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl"),
-        os.path.join(base, "interpolated", "phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256_INTERPOLATED.pkl"),
-    ]) or os.path.join(base, "phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256_INTERPOLATED.pkl")
-
-    # meta dir
-    meta_dir_path = _first_existing([
-        os.path.join(base, "_meta"),
-        os.path.join(base, "meta"),
-    ]) or os.path.join(base, "_meta")
-
-    # gloss dict
-    gloss_dict_path = _first_existing([
-        os.path.join(base, "gloss_dict_normalized.npy"),
-        os.path.join(base, "gloss_dict.npy"),
-    ]) or os.path.join(base, "gloss_dict_normalized.npy")
-
-    return image_prefix, qgrid_prefix, kp_path, meta_dir_path, gloss_dict_path
-
-
-def resolve_dataset_paths(args) -> Tuple[str, str, str, str, str]:
-    """
-    Priority: CLI flag -> ENV -> guess
-    ENV names:
-      PHX_IMAGE_PREFIX, PHX_QGRID_PREFIX, PHX_KP_PATH, PHX_META_DIR, PHX_GLOSS_DICT
-    """
-    env = os.environ
-    image_prefix = args.image_prefix or env.get("PHX_IMAGE_PREFIX")
-    qgrid_prefix = args.qgrid_prefix or env.get("PHX_QGRID_PREFIX")
-    kp_path      = args.kp_path      or env.get("PHX_KP_PATH")
-    meta_dir     = args.meta_dir_path or env.get("PHX_META_DIR")
-    gloss_dict   = args.gloss_dict_path or env.get("PHX_GLOSS_DICT")
-
-    if all([image_prefix, qgrid_prefix, kp_path, meta_dir, gloss_dict]):
-        return image_prefix, qgrid_prefix, kp_path, meta_dir, gloss_dict
-
-    # Fall back to guessing
-    gi, gq, gk, gm, gg = guess_phoenix_paths()
-    return (
-        image_prefix or gi,
-        qgrid_prefix or gq,
-        kp_path or gk,
-        meta_dir or gm,
-        gloss_dict or gg,
-    )
-
-
-# ==========================
-# Arg parsing
-# ==========================
+# -------------------------------
+# Args (your exact defaults)
+# -------------------------------
 def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint .pt")
-    ap.add_argument("--split", type=str, default="test", choices=["train", "dev", "valid", "val", "test"])
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--num_workers", type=int, default=2)
-    ap.add_argument("--bf16", action="store_true")
-    ap.add_argument("--force_num_classes", type=int, default=None)
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpt", required=True, type=str, help="Path to checkpoint .pt")
+    p.add_argument("--image_prefix", required=False, default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
+    p.add_argument("--qgrid_prefix", required=False, default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
+    p.add_argument("--kp_path",      required=False, default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
+    p.add_argument("--meta_dir",     required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
+    p.add_argument("--gloss_dict",   required=False, default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
+    p.add_argument("--split", choices=["train", "val", "test"], default="test")
 
-    # Optional dataset paths (if omitted, we'll auto-resolve)
-    ap.add_argument("--image_prefix", type=str, default=None)
-    ap.add_argument("--qgrid_prefix", type=str, default=None)
-    ap.add_argument("--kp_path", type=str, default=None)
-    ap.add_argument("--meta_dir_path", type=str, default=None)
-    ap.add_argument("--gloss_dict_path", type=str, default=None)
-    return ap.parse_args()
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--bf16", action="store_true")
+    p.add_argument("--force_num_classes", type=int, default=None)
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args()
 
 
-# ==========================
+# -------------------------------
 # Evaluation
-# ==========================
+# -------------------------------
 @torch.no_grad()
 def evaluate(model: nn.Module,
              dl: DataLoader,
@@ -180,12 +86,16 @@ def evaluate(model: nn.Module,
     model.eval()
     blank_idx = 0
 
-    total_wer_edits, total_wer_tokens = 0, 0
-    total_cer_edits, total_cer_chars = 0, 0
+    total_wer_edits = 0
+    total_wer_tokens = 0
+    total_cer_edits = 0
+    total_cer_chars = 0
     total_samples = 0
 
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float32
-    autocast_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if (use_bf16 and device.startswith("cuda")) else torch.cuda.amp.autocast(enabled=False)
+    autocast_ctx = (torch.autocast(device_type="cuda", dtype=amp_dtype)
+                    if (use_bf16 and device.startswith("cuda"))
+                    else torch.cuda.amp.autocast(enabled=False))
 
     def collapse_and_map(ids):
         seq = []
@@ -198,21 +108,22 @@ def evaluate(model: nn.Module,
                 continue
             seq.append(t)
             prev = t
-        toks = [id2gloss.get(int(x), "<UNK>") for x in seq]
-        return toks
+        return [id2gloss.get(int(x), "<UNK>") for x in seq]
 
     def edit_distance(a, b):
         m, n = len(a), len(b)
-        dp = [[0]*(n+1) for _ in range(m+1)]
-        for i in range(m+1): dp[i][0] = i
-        for j in range(n+1): dp[0][j] = j
-        for i in range(1, m+1):
-            for j in range(1, n+1):
-                cost = 0 if a[i-1] == b[j-1] else 1
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        for i in range(m + 1):
+            dp[i][0] = i
+        for j in range(n + 1):
+            dp[0][j] = j
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
                 dp[i][j] = min(
-                    dp[i-1][j] + 1,
-                    dp[i][j-1] + 1,
-                    dp[i-1][j-1] + cost
+                    dp[i - 1][j] + 1,
+                    dp[i][j - 1] + 1,
+                    dp[i - 1][j - 1] + cost
                 )
         return dp[m][n]
 
@@ -222,17 +133,17 @@ def evaluate(model: nn.Module,
         return edit_distance(a, b), len(b)
 
     for batch in dl:
-        # Dict-style batch from your dataset
-        if isinstance(batch, dict):
-            images = batch.get("images") or batch.get("frames")
-            qgrids = batch.get("qgrids") or batch.get("qgrid")
-            keypoints = batch.get("keypoints") or batch.get("kps") or batch.get("pose")
-            qgrid_lengths = batch.get("qgrid_lengths") or batch.get("qgrid_len") or batch.get("lengths")
-            # references
-            y_ids = batch.get("gloss_ids") or batch.get("targets") or batch.get("labels")
-            y_text = batch.get("gloss_str") or batch.get("gloss") or batch.get("text")
-        else:
-            raise RuntimeError("Batch format unexpected; expected dict-like from MultiModalPhoenixDataset.")
+        # MultiModalPhoenixDataset should return a dict
+        if not isinstance(batch, dict):
+            raise RuntimeError("Expected dict batches from MultiModalPhoenixDataset.")
+
+        images = batch.get("images") or batch.get("frames")
+        qgrids = batch.get("qgrids") or batch.get("qgrid")
+        keypoints = batch.get("keypoints") or batch.get("kps") or batch.get("pose")
+        qgrid_lengths = batch.get("qgrid_lengths") or batch.get("qgrid_len") or batch.get("lengths")
+
+        y_ids = batch.get("gloss_ids") or batch.get("targets") or batch.get("labels")
+        y_text = batch.get("gloss_str") or batch.get("gloss") or batch.get("text")
 
         images = images.to(device, non_blocking=True)
         qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
@@ -276,9 +187,9 @@ def evaluate(model: nn.Module,
     return WER, CER, total_samples
 
 
-# ==========================
+# -------------------------------
 # Main
-# ==========================
+# -------------------------------
 def main():
     args = parse_args()
     warnings.filterwarnings("once", category=FutureWarning)
@@ -286,65 +197,47 @@ def main():
     device = args.device
     map_location = torch.device(device)
 
-    # ----- dataset -----
-    # Resolve dataset paths if constructor requires them
-    ds = None
-    try:
-        # Try the minimal constructor first (some versions support this)
-        ds = MultiModalPhoenixDataset(split=args.split)
-    except TypeError:
-        # Fall back to full-arg constructor
-        image_prefix, qgrid_prefix, kp_path, meta_dir_path, gloss_dict_path = resolve_dataset_paths(args)
-        print(f"[dataset paths]\n  image_prefix = {image_prefix}\n  qgrid_prefix = {qgrid_prefix}\n  kp_path = {kp_path}\n  meta_dir = {meta_dir_path}\n  gloss_dict = {gloss_dict_path}")
-        ds = MultiModalPhoenixDataset(
-            image_prefix=image_prefix,
-            qgrid_prefix=qgrid_prefix,
-            kp_path=kp_path,
-            meta_dir_path=meta_dir_path,
-            gloss_dict_path=gloss_dict_path,
-            split=args.split,
-        )
+    # Dataset — pass your args directly; note param names on ctor
+    ds = MultiModalPhoenixDataset(
+        image_prefix=args.image_prefix,
+        qgrid_prefix=args.qgrid_prefix,
+        kp_path=args.kp_path,
+        meta_dir_path=args.meta_dir,         # <-- ctor expects meta_dir_path
+        gloss_dict_path=args.gloss_dict,     # <-- ctor expects gloss_dict_path
+        split=args.split,
+    )
 
-    # id2gloss / blank idx
+    # id2gloss for decoding
     id2gloss = getattr(ds, "id2gloss", None)
     if id2gloss is None:
         gloss_list = getattr(ds, "gloss_list", None)
-        if gloss_list is not None and isinstance(gloss_list, (list, tuple)):
+        if isinstance(gloss_list, (list, tuple)):
             id2gloss = {i: g for i, g in enumerate(gloss_list)}
         else:
             raise RuntimeError("Could not locate id2gloss mapping on dataset.")
-    blank_idx = getattr(ds, "blank_idx", 0)
-    print(f"[gloss] loaded {len(id2gloss)} entries; blank idx={blank_idx}; sample: {list(id2gloss.values())[:5]}")
-
-    # Let the dataset report what it kept/dropped (dataset likely prints this internally)
-    print(f"[MultiModalPhoenixDataset] len={len(ds)} split={args.split}")
 
     collate_fn = getattr(ds, "collate_fn", None)
-    if callable(collate_fn):
-        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers, pin_memory=True,
-                        collate_fn=collate_fn)
-    else:
-        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers, pin_memory=True)
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn if callable(collate_fn) else None,
+    )
 
-    # ----- model -----
-    n_classes = (args.force_num_classes or len(id2gloss))
+    # Model
+    n_classes = args.force_num_classes or len(id2gloss)
     if args.force_num_classes:
         print(f"[head] num_classes={n_classes} (forced)")
-    else:
-        print(f"[head] num_classes={n_classes}")
+    model = MultiModalMamba(num_classes=n_classes).to(device)
 
-    model = MultiModalMamba(num_classes=n_classes)
-    model.to(device)
-
-    # load checkpoint (try new safe API first)
-    ckpt_path = args.ckpt
-    print(f"[ckpt] loading: {ckpt_path}")
+    # Load checkpoint (try weights_only when available)
+    print(f"[ckpt] loading: {args.ckpt}")
     try:
-        ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=True)  # PyTorch 2.5+
+        ckpt = torch.load(args.ckpt, map_location=map_location, weights_only=True)  # PyTorch 2.5+
     except TypeError:
-        ckpt = torch.load(ckpt_path, map_location=map_location)
+        ckpt = torch.load(args.ckpt, map_location=map_location)
 
     # Accept common formats
     state_dict = ckpt.get("state_dict") if isinstance(ckpt, dict) else None
@@ -354,7 +247,7 @@ def main():
         else:
             state_dict = ckpt.get("model", ckpt.get("model_state", {})) if isinstance(ckpt, dict) else {}
 
-    # strip common prefixes
+    # Strip common prefixes
     def _strip(sd: Dict[str, Any], prefixes=("module.", "model.")):
         out = {}
         for k, v in sd.items():
@@ -366,12 +259,11 @@ def main():
         return out
 
     state_dict = _strip(state_dict)
-
-    # Non-strict to allow head or depth mismatches
     ld = model.load_state_dict(state_dict, strict=False)
-    # PyTorch <=2.4 returns NamedTuple; in 2.5 it's dict-like. Handle both.
-    missing = getattr(ld, "missing_keys", None) or ld.get("missing_keys", [])
-    unexpected = getattr(ld, "unexpected_keys", None) or ld.get("unexpected_keys", [])
+
+    # Report unexpected/missing, but keep going
+    missing = getattr(ld, "missing_keys", None) or (ld.get("missing_keys", []) if isinstance(ld, dict) else [])
+    unexpected = getattr(ld, "unexpected_keys", None) or (ld.get("unexpected_keys", []) if isinstance(ld, dict) else [])
     if unexpected:
         print(f"[ckpt] strict load failed with unexpected keys ({len(unexpected)}). "
               f"Loading non-head layers and reinitializing classifier.")
@@ -383,9 +275,8 @@ def main():
         model.frame_encoder = _FrameEncoderAdapter(model.frame_encoder)
     print("[patch] FrameEncoderAdapter attached.")
 
-    # ----- eval -----
-    use_bf16 = bool(args.bf16)
-    WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=use_bf16)
+    # Eval
+    WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=bool(args.bf16))
     print(f"[RESULT] N={N}  WER={WER:.2f}%  CER={CER:.2f}%")
 
 
