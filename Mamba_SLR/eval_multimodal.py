@@ -5,7 +5,7 @@ import argparse
 import os
 import inspect
 import math
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Any
 
 import torch
 from torch.utils.data import DataLoader
@@ -179,23 +179,75 @@ def load_weights_lenient(model: torch.nn.Module, state_dict: Dict[str, torch.Ten
 
 
 # ----------------------------
-# Batch normalization (robust to list/tuple)
+# Batch normalization (robust to list/tuple variants)
 # ----------------------------
+def _unwrap_singleton(x: Any) -> Any:
+    # Peel nested [x] or (x,) layers
+    while isinstance(x, (list, tuple)) and len(x) == 1:
+        x = x[0]
+    return x
+
+
+def _as_sample_dicts_from_tuples(sample_list: List[tuple]) -> List[dict]:
+    out = []
+    for t in sample_list:
+        # Accept 4-tuple (no labels) or 5-tuple (with labels)
+        if not isinstance(t, (list, tuple)) or not (4 <= len(t) <= 5):
+            return []
+        d = {
+            "images": t[0],
+            "qgrids": t[1],
+            "keypoints": t[2],
+            "qgrid_lengths": t[3],
+        }
+        if len(t) == 5:
+            d["labels"] = t[4]
+        out.append(d)
+    return out
+
+
 def normalize_batch(batch: Union[dict, list, tuple]) -> dict:
     """
-    Ensure we always end up with a dict like training:
-      keys: images, qgrids, keypoints, qgrid_lengths, labels (optional)
+    Convert whatever the DataLoader gave us into the standard training dict:
+      keys: images, qgrids, keypoints, qgrid_lengths, (labels optional)
+    Handles:
+      - dict (already batched)
+      - list of dicts      -> collate
+      - list of tuples     -> convert to dicts then collate
+      - list of tensors    -> map by position
+      - nested singletons  -> unwrap then retry
     """
+    batch = _unwrap_singleton(batch)
+
     if isinstance(batch, dict):
         return batch
+
     if isinstance(batch, (list, tuple)):
-        # common cases:
-        # 1) [ {sample1}, {sample2}, ... ]  -> fold with our collate
-        if len(batch) > 0 and all(isinstance(b, dict) for b in batch):
-            return multi_modal_collate_fn(batch)
-        # 2) [ {batched_dict} ] -> unwrap
-        if len(batch) == 1 and isinstance(batch[0], dict):
-            return batch[0]
+        if len(batch) == 0:
+            raise TypeError("Empty batch")
+
+        # Case A: list of dicts
+        if all(isinstance(b, dict) for b in batch):
+            return multi_modal_collate_fn(list(batch))
+
+        # Case B: list of tuples (per-sample)
+        if all(isinstance(b, (list, tuple)) for b in batch):
+            sample_dicts = _as_sample_dicts_from_tuples(list(batch))
+            if sample_dicts:
+                return multi_modal_collate_fn(sample_dicts)
+
+        # Case C: list of tensors already split positionally
+        if all(torch.is_tensor(b) for b in batch) and (4 <= len(batch) <= 5):
+            d = {
+                "images": batch[0],
+                "qgrids": batch[1],
+                "keypoints": batch[2],
+                "qgrid_lengths": batch[3],
+            }
+            if len(batch) == 5:
+                d["labels"] = batch[4]
+            return d
+
     raise TypeError(f"Unexpected batch type: {type(batch)}")
 
 
@@ -242,8 +294,7 @@ def evaluate(model, dataloader, id2gloss: List[str], device: torch.device, use_b
                     ref_ids = labels_list[b].tolist()
                     ref_tokens = [id2gloss[i] if 0 <= i < len(id2gloss) else f"<oob:{i}>" for i in ref_ids]
                 else:
-                    # if eval split has no labels, skip metrics accumulation
-                    continue
+                    continue  # no labels -> skip metric
 
                 total_wer += wer(ref_tokens, hyp_tokens)
                 total_cer += cer(" ".join(ref_tokens), " ".join(hyp_tokens))
@@ -297,7 +348,7 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=multi_modal_collate_fn,  # even if this is bypassed, normalize_batch() will recover
+        collate_fn=multi_modal_collate_fn,  # normalize_batch will still recover if this is bypassed
     )
 
     # 3) model from ckpt
