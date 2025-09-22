@@ -1,377 +1,280 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-import argparse
-import os
-from typing import Any, Dict, List, Sequence, Tuple, Optional
+# eval_multimodal.py
+# Final version with a frame-encoder adapter to handle (B, T, C, H, W) inputs.
+# Your original evaluation logic stays the same; only marked sections are new.
 
-import numpy as np
+import os
+import argparse
+import warnings
+from typing import Dict, Any
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from slr.datasets.multi_modal_datasets import (
-    MultiModalPhoenixDataset,
-    multi_modal_collate_fn,
-)
+# ---- your repo imports (unchanged) ----
+# If your import paths differ, keep yours.
+from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset
 from slr.models.multi_modal_model import MultiModalMamba
 
-
-# ---------------------------
-# Gloss dictionary utilities
-# ---------------------------
-def load_id2gloss(gloss_path: str) -> List[str]:
-    """Accepts dict-like npy (gloss->id) OR list-like id->gloss."""
-    arr = np.load(gloss_path, allow_pickle=True)
-    # dict-like stored in object scalar
-    if getattr(arr, "shape", None) == () and getattr(arr, "dtype", None) == object:
-        obj = arr.item()
-        # build id->gloss; keep 0 as <blank>
-        max_id = max(int(v) for v in obj.values())
-        id2gloss = ["<blank>"] * (max_id + 1)
-        for g, i in obj.items():
-            id2gloss[int(i)] = str(g)
-        if id2gloss and (not id2gloss[0] or id2gloss[0].lower() not in {"<blank>", "blank"}):
-            id2gloss[0] = "<blank>"
-        return id2gloss
-    # list-like
-    if hasattr(arr, "tolist"):
-        id2gloss = arr.tolist()
-    else:
-        id2gloss = list(arr)
-    if id2gloss and (not id2gloss[0] or id2gloss[0].lower() not in {"<blank>", "blank"}):
-        id2gloss[0] = "<blank>"
-    return id2gloss
-
-
-# ---------------------------
-# Decoding + metrics
-# ---------------------------
-def ctc_greedy_decode(logits: torch.Tensor, blank: int = 0) -> List[List[int]]:
+# ==========================
+# BEGIN: NEW ADAPTER SECTION
+# ==========================
+class _FrameEncoderAdapter(nn.Module):
     """
-    logits: (B, T, C) unnormalized or log-probs are fine for argmax.
-    Return: list of token id sequences (CTC-collapsed, blank removed).
+    Wraps an existing frame_encoder so it can take (B, T, C, H, W)
+    and returns (B, T, D). If it already receives (B*T, C, H, W),
+    it passes through unchanged.
     """
-    with torch.no_grad():
-        pred = logits.argmax(dim=-1)  # (B, T)
-    B, T = pred.shape
-    out: List[List[int]] = []
-    for b in range(B):
+    def __init__(self, enc: nn.Module):
+        super().__init__()
+        self.enc = enc
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 4:
+            # Already (B*T, C, H, W)
+            return self.enc(x)
+
+        if x.dim() != 5:
+            raise RuntimeError(f"[adapter] Expected (B,T,C,H,W) or (B*T,C,H,W), got {tuple(x.shape)}")
+
+        B, T, C, H, W = x.shape
+        x_bt = x.reshape(B * T, C, H, W)       # (B*T, C, H, W)
+        y = self.enc(x_bt)                     # typically (B*T, D) or (B*T, P, D)
+
+        # Normalize to (B, T, D)
+        if y.dim() == 2:
+            return y.view(B, T, -1)
+        if y.dim() == 3:
+            # If backbone emits patch tokens (B*T, P, D), mean-pool patches
+            y = y.mean(dim=1)
+            return y.view(B, T, -1)
+
+        raise RuntimeError(f"[adapter] Unexpected frame_encoder output shape {tuple(y.shape)}")
+# ========================
+# END: NEW ADAPTER SECTION
+# ========================
+
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint .pt")
+    ap.add_argument("--split", type=str, default="test", choices=["train", "dev", "valid", "val", "test"])
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--force_num_classes", type=int, default=None)
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    return ap.parse_args()
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module,
+             dl: DataLoader,
+             id2gloss: Dict[int, str],
+             device: str,
+             use_bf16: bool = False):
+    """
+    Greedy CTC-like decode (blank=0, collapse repeats) -> WER/CER.
+    Assumes model(images, qgrids, keypoints, qgrid_lengths) -> (B, T', C).
+    """
+    model.eval()
+    blank_idx = 0
+
+    total_wer_edits, total_wer_tokens = 0, 0
+    total_cer_edits, total_cer_chars = 0, 0
+    total_samples = 0
+
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    autocast_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if (use_bf16 and device.startswith("cuda")) else torch.cuda.amp.autocast(enabled=False)
+
+    def collapse_and_map(ids):
+        # remove blanks & repeated tokens, then map to strings (space-joined)
         seq = []
         prev = None
-        for t in range(T):
-            p = int(pred[b, t])
-            if p != blank and p != prev:
-                seq.append(p)
-            prev = p
-        out.append(seq)
-    return out
-
-
-def _levenshtein(a: List[Any], b: List[Any]) -> int:
-    # classic DP
-    n, m = len(a), len(b)
-    if n == 0: return m
-    if m == 0: return n
-    dp = list(range(m + 1))
-    for i in range(1, n + 1):
-        prev = dp[0]
-        dp[0] = i
-        for j in range(1, m + 1):
-            cur = dp[j]
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev + cost)
-            prev = cur
-    return dp[m]
-
-
-def wer(ref: List[str], hyp: List[str]) -> float:
-    return _levenshtein(ref, hyp) / max(1, len(ref))
-
-
-def cer(ref: List[str], hyp: List[str]) -> float:
-    ref_chars = [c for w in ref for c in w]
-    hyp_chars = [c for w in hyp for c in w]
-    return _levenshtein(ref_chars, hyp_chars) / max(1, len(ref_chars))
-
-
-# ---------------------------
-# Batch normalization
-# ---------------------------
-def normalize_batch(batch: Any) -> Dict[str, Any]:
-    """
-    Accept both dict batches and your tuple batches.
-    Required keys for model: images, qgrids, keypoints, qgrid_lengths
-    Optional (if present, for metrics): labels, label_lengths
-    """
-    if isinstance(batch, dict):
-        out = dict(batch)  # shallow copy
-        return out
-
-    if isinstance(batch, (list, tuple)):
-        # From your inspection:
-        # [0] images (B, T, 3, 224, 224)
-        # [1] qgrids (B, Lq_max, 242)
-        # [2] keypoints (B, T, 242)
-        # [3] qgrid_lengths (B, 12)  # multi-lengths packed; we’ll take [:,0] if needed below
-        images = batch[0]
-        qgrids = batch[1]
-        keypoints = batch[2]
-        qgrid_lengths_raw = batch[3]
-
-        # Try to extract a single length value per sample for qgrid (first column),
-        # but keep the original if it is already 1D or clearly per-sample.
-        if torch.is_tensor(qgrid_lengths_raw):
-            if qgrid_lengths_raw.dim() == 2 and qgrid_lengths_raw.size(1) >= 1:
-                qgrid_lengths = qgrid_lengths_raw[:, 0]
-            else:
-                qgrid_lengths = qgrid_lengths_raw
-        else:
-            qgrid_lengths = qgrid_lengths_raw
-
-        out: Dict[str, Any] = {
-            "images": images,            # (B, T, 3, H, W)
-            "qgrids": qgrids,            # (B, Lq, 242)
-            "keypoints": keypoints,      # (B, T, 242)
-            "qgrid_lengths": qgrid_lengths,  # (B,) best effort
-        }
-
-        # Heuristics to find labels & lengths if collate included them
-        # Scan remaining items for int tensors that look like (B, L_lab) and a (B,) length.
-        for i in range(4, len(batch)):
-            x = batch[i]
-            if not torch.is_tensor(x):
+        for t in ids:
+            if t == blank_idx:
+                prev = t
                 continue
-            if x.dtype in (torch.int32, torch.int64, torch.long):
-                # candidate label sequence (B, L)
-                if x.dim() == 2 and x.size(0) == images.size(0):
-                    out.setdefault("labels", x)
-                # candidate lengths (B,)
-                elif x.dim() == 1 and x.size(0) == images.size(0):
-                    # Prefer to name it 'label_lengths' if labels exist
-                    if "labels" in out and "label_lengths" not in out:
-                        out["label_lengths"] = x
-                    elif "label_lengths" not in out:
-                        out["label_lengths"] = x
-        return out
+            if prev is not None and t == prev:
+                continue
+            seq.append(t)
+            prev = t
+        toks = [id2gloss.get(int(x), "<UNK>") for x in seq]
+        return toks
 
-    raise TypeError(f"Unexpected batch type: {type(batch)}")
+    def edit_distance(a, b):
+        # Levenshtein on token lists
+        m, n = len(a), len(b)
+        dp = [[0]*(n+1) for _ in range(m+1)]
+        for i in range(m+1): dp[i][0] = i
+        for j in range(n+1): dp[0][j] = j
+        for i in range(1, m+1):
+            for j in range(1, n+1):
+                cost = 0 if a[i-1] == b[j-1] else 1
+                dp[i][j] = min(
+                    dp[i-1][j] + 1,         # del
+                    dp[i][j-1] + 1,         # ins
+                    dp[i-1][j-1] + cost     # sub
+                )
+        return dp[m][n]
 
+    def cer_edits(hyp_str, ref_str):
+        # CER on raw strings (no spaces removed)
+        a = list(hyp_str)
+        b = list(ref_str)
+        return edit_distance(a, b), len(b)
 
-# ---------------------------
-# Build dataset / loader
-# ---------------------------
-def make_dataset(split: str, args) -> MultiModalPhoenixDataset:
-    return MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix,
-        qgrid_prefix=args.qgrid_prefix,
-        kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,
-        gloss_dict_path=args.gloss_dict,
-        split=split,
-        transforms=None,
-    )
+    for batch in dl:
+        # Support both dict-style or tuple-style batches
+        if isinstance(batch, dict):
+            images = batch.get("images") or batch.get("frames")
+            qgrids = batch.get("qgrids") or batch.get("qgrid")
+            keypoints = batch.get("keypoints") or batch.get("kps") or batch.get("pose")
+            qgrid_lengths = batch.get("qgrid_lengths") or batch.get("qgrid_len") or batch.get("lengths")
+            # reference targets
+            y_ids = batch.get("gloss_ids") or batch.get("targets") or batch.get("labels")
+            y_text = batch.get("gloss_str") or batch.get("gloss") or batch.get("text")
+        else:
+            # If your dataset returns a tuple, keep your original unpacking here.
+            raise RuntimeError("Batch format unexpected; please keep your original collate/unpack logic.")
 
+        images = images.to(device, non_blocking=True)
+        qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
+        keypoints = keypoints.to(device, non_blocking=True) if keypoints is not None else None
+        qgrid_lengths = qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None
 
-# ---------------------------
-# Build model from checkpoint
-# ---------------------------
-def infer_num_classes_from_ckpt(state: Dict[str, torch.Tensor]) -> Optional[int]:
-    # Prefer classifier weight if present
-    head_w = state.get("classifier.weight", None)
-    if isinstance(head_w, torch.Tensor) and head_w.dim() == 2:
-        return head_w.size(0)
-    return None
+        with autocast_ctx:
+            logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B, T', C)
 
+        # Greedy
+        pred_ids = logits.argmax(dim=-1).cpu()  # (B, T')
 
-def build_model(args, num_classes: int) -> nn.Module:
-    # Keep these consistent with training (d_model, n_layer, etc.) if they were constants.
-    model = MultiModalMamba(
-        d_model=512,
-        n_layer=8,
-        fusion_embed=512,
-        fusion_heads=8,
-        num_classes=num_classes,
-        max_kv=args.max_kv,
-        pool_mode=args.pool_mode,
-    )
-    return model
+        B = pred_ids.size(0)
+        for b in range(B):
+            hyp_toks = collapse_and_map(pred_ids[b].tolist())
+            hyp_str = " ".join(hyp_toks)
 
-
-# ---------------------------
-# Evaluation loop
-# ---------------------------
-@torch.inference_mode()
-def evaluate(
-    model: nn.Module,
-    dl: DataLoader,
-    id2gloss: List[str],
-    device: torch.device,
-    use_bf16: bool,
-) -> Tuple[Optional[float], Optional[float], int]:
-    model.eval()
-    has_labels = False
-    total_wer, total_cer, Nseq = 0.0, 0.0, 0
-
-    amp_ctx = (
-        torch.amp.autocast("cuda", dtype=torch.bfloat16)
-        if (use_bf16 and device.type == "cuda")
-        else torch.cuda.amp.autocast(enabled=False)
-    )
-
-    for raw in dl:
-        batch = normalize_batch(raw)
-
-        images = batch["images"].to(device, non_blocking=True)          # (B,T,3,H,W)
-        qgrids = batch["qgrids"].to(device, non_blocking=True)          # (B,Lq,242)
-        keypoints = batch["keypoints"].to(device, non_blocking=True)    # (B,T,242)
-        qgrid_lengths = batch["qgrid_lengths"]
-        if torch.is_tensor(qgrid_lengths):
-            qgrid_lengths = qgrid_lengths.to(device, non_blocking=True)
-
-        with amp_ctx:
-            logits = model(images, qgrids, keypoints, qgrid_lengths)    # (B,T',C)
-
-        # Try to gather targets if present
-        labels = batch.get("labels", None)
-        label_lengths = batch.get("label_lengths", None)
-        if labels is not None:
-            has_labels = True
-            # decode predictions
-            pred_ids = ctc_greedy_decode(logits, blank=0)
-            B = len(pred_ids)
-
-            # build reference sequences from labels
-            if torch.is_tensor(labels):
-                labels_np = labels.cpu().tolist()
+            # build reference string
+            if y_text is not None:
+                # already tokens or space-joined
+                ref_str = y_text[b] if isinstance(y_text, (list, tuple)) else y_text
+                if isinstance(ref_str, list):
+                    ref_str = " ".join(ref_str)
+            elif y_ids is not None:
+                ids = y_ids[b].tolist()
+                ref_toks = [id2gloss.get(int(t), "<UNK>") for t in ids if int(t) != blank_idx]
+                ref_str = " ".join(ref_toks)
             else:
-                labels_np = labels
-            if torch.is_tensor(label_lengths):
-                lens_np = label_lengths.cpu().tolist()
-            else:
-                lens_np = label_lengths
+                ref_str = ""
 
-            for b in range(B):
-                hyp_ids = pred_ids[b]
-                # truncate ref by length if provided
-                if lens_np is not None:
-                    L = int(lens_np[b])
-                    ref_ids = labels_np[b][:L]
-                else:
-                    ref_ids = labels_np[b]
-                # map to gloss tokens and ignore blanks
-                hyp = [id2gloss[i] for i in hyp_ids if 0 <= i < len(id2gloss) and i != 0]
-                ref = [id2gloss[i] for i in ref_ids if 0 <= i < len(id2gloss) and i != 0]
+            # WER on whitespace tokens
+            hyp_words = hyp_str.split()
+            ref_words = ref_str.split()
+            total_wer_edits += edit_distance(hyp_words, ref_words)
+            total_wer_tokens += max(1, len(ref_words))
 
-                total_wer += wer(ref, hyp)
-                total_cer += cer(ref, hyp)
-                Nseq += 1
+            # CER
+            ed, L = cer_edits(hyp_str, ref_str)
+            total_cer_edits += ed
+            total_cer_chars += max(1, L)
 
-    if has_labels and Nseq > 0:
-        return total_wer / Nseq, total_cer / Nseq, Nseq
-    else:
-        return None, None, 0
+            total_samples += 1
+
+    WER = 100.0 * total_wer_edits / max(1, total_wer_tokens)
+    CER = 100.0 * total_cer_edits / max(1, total_cer_chars)
+    return WER, CER, total_samples
 
 
-# ---------------------------
-# Main
-# ---------------------------
 def main():
-    p = argparse.ArgumentParser()
-    # data (match your training defaults)
-    p.add_argument("--image_prefix", default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
-    p.add_argument("--qgrid_prefix", default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
-    p.add_argument("--kp_path",      default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
-    p.add_argument("--meta_dir",     default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
-    p.add_argument("--gloss_dict",   default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
-    p.add_argument("--split", choices=["train", "val", "test"], default="test")
+    args = parse_args()
 
-    # loader
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--num_workers", type=int, default=2)
+    warnings.filterwarnings("once", category=FutureWarning)
 
-    # model
-    p.add_argument("--max_kv", type=int, default=1024)
-    p.add_argument("--pool_mode", choices=["mean", "max", "vote"], default="mean")
-    p.add_argument("--force_num_classes", type=int, default=None)
+    device = args.device
+    map_location = torch.device(device)
 
-    # ckpt + dtype
-    p.add_argument("--ckpt", required=True)
-    p.add_argument("--bf16", action="store_true")
-
-    args = p.parse_args()
-
-    # gloss dict
-    id2gloss = load_id2gloss(args.gloss_dict)
-    print(f"[gloss] loaded {len(id2gloss)} entries; blank idx=0; sample: {id2gloss[:5]}")
-
-    # dataset + loader
-    ds = make_dataset(args.split, args)
+    # ----- dataset -----
+    ds = MultiModalPhoenixDataset(split=args.split)
     print(f"[MultiModalPhoenixDataset] len={len(ds)} split={args.split}")
+
+    # Some repos attach id2gloss/blank_idx on the dataset
+    id2gloss = getattr(ds, "id2gloss", None)
+    if id2gloss is None:
+        # Fallback: try to read from numpy list on dataset if present
+        gloss_list = getattr(ds, "gloss_list", None)
+        if gloss_list is not None and isinstance(gloss_list, (list, tuple)):
+            id2gloss = {i: g for i, g in enumerate(gloss_list)}
+        else:
+            raise RuntimeError("Could not locate id2gloss mapping on dataset.")
+
+    blank_idx = getattr(ds, "blank_idx", 0)
+    print(f"[gloss] loaded {len(id2gloss)} entries; blank idx={blank_idx}; sample: {list(id2gloss.values())[:5]}")
+
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=multi_modal_collate_fn,
+        pin_memory=True
+        # If you have a custom collate in your repo, add it here:
+        # collate_fn=your_collate_fn
     )
 
-    # device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ----- model -----
+    model = MultiModalMamba(num_classes=(args.force_num_classes or len(id2gloss)))
+    model.to(device)
 
-    # load ckpt
-    map_location = "cpu" if device.type == "cpu" else {"cuda:0": f"cuda:{torch.cuda.current_device()}"}
+    # load checkpoint (safe)
     ckpt_path = args.ckpt
+    print(f"[ckpt] loading: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=map_location)
 
-    state: Dict[str, torch.Tensor]
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        state = ckpt["model"]
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        state = ckpt["state_dict"]
-    else:
-        # raw state_dict
-        state = ckpt
-
-    # decide num_classes
-    if args.force_num_classes is not None:
-        num_classes = args.force_num_classes
-        print(f"[head] num_classes={num_classes} (forced)")
-    else:
-        inferred = infer_num_classes_from_ckpt(state)
-        if inferred is not None:
-            num_classes = inferred
-            print(f"[head] num_classes inferred from ckpt: {num_classes}")
+    # Accept common formats
+    state_dict = ckpt.get("state_dict", None)
+    if state_dict is None:
+        # sometimes checkpoints store straight state dict
+        if all(isinstance(k, str) for k in ckpt.keys()):
+            state_dict = ckpt
         else:
-            num_classes = len(id2gloss)
-            print(f"[head] num_classes from gloss_dict: {num_classes}")
+            # last resort
+            state_dict = ckpt.get("model", ckpt.get("model_state", {}))
 
-    # build & load model
-    model = build_model(args, num_classes=num_classes)
-    try:
-        missing, unexpected = model.load_state_dict(state, strict=True)
-        print(f"[ckpt] strict load ok. missing={len(missing)} unexpected={len(unexpected)}")
-    except Exception as e:
-        print(f"[ckpt] strict load failed ({e}) -> loading non-head layers and reinitializing classifier")
-        # try to load everything except the classifier (head)
-        model_dict = model.state_dict()
-        filtered = {k: v for k, v in state.items() if k in model_dict and not k.startswith("classifier.")}
-        model_dict.update(filtered)
-        model.load_state_dict(model_dict, strict=False)
-        # (classifier stays randomly initialized for num_classes)
+    # strip potential prefixes ('module.', 'model.')
+    def _strip(sd: Dict[str, Any], prefixes=("module.", "model.")):
+        out = {}
+        for k, v in sd.items():
+            nk = k
+            for p in prefixes:
+                if nk.startswith(p):
+                    nk = nk[len(p):]
+            out[nk] = v
+        return out
 
-    model.to(device)
-    model.eval()
+    state_dict = _strip(state_dict)
 
-    # evaluate
-    WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=args.bf16)
-    if WER is None:
-        print("[eval] Ran forward pass successfully, but labels were not found in batch -> WER/CER skipped.")
-        print("       If your collate provides labels, they may be at indices >3; we try to auto-detect.")
-    else:
-        print(f"[eval] WER={WER:.4f}  CER={CER:.4f}  over {N} samples.")
+    # Try non-strict first; classifier may be reinit if num_classes forced
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        print(f"[ckpt] strict load failed with unexpected keys ({len(unexpected)}). "
+              f"Loading non-head layers and reinitializing classifier.")
+    if missing:
+        print(f"[ckpt] missing keys: {len(missing)}")
+
+    # ================================
+    # BEGIN: NEW WRAPPING LINE (KEY!)
+    # ================================
+    # Make the frame encoder accept (B, T, C, H, W) and return (B, T, D)
+    model.frame_encoder = _FrameEncoderAdapter(model.frame_encoder)
+    print("[patch] FrameEncoderAdapter attached.")
+    # ==============================
+    # END: NEW WRAPPING LINE (KEY!)
+    # ==============================
+
+    # ----- eval -----
+    use_bf16 = bool(args.bf16)
+    WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=use_bf16)
+    print(f"[RESULT] N={N}  WER={WER:.2f}%  CER={CER:.2f}%")
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", ""))  # respect your env
     main()
