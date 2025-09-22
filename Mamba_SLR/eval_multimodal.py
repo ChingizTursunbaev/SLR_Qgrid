@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # eval_multimodal.py — evaluation that matches ddp_train_multimodal packing/wrapping
+from pyexpat import model
 import argparse, warnings, math
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -173,81 +174,145 @@ def evaluate(model: nn.Module,
              loader: DataLoader,
              id2gloss: Dict[int,str],
              device: torch.device,
-             use_bf16: bool=False) -> Tuple[float,float,int]:
+             use_bf16: bool=False,
+             force_blank_id: Optional[int]=None) -> Tuple[float,float,int,int,float]:
+    """
+    Returns: WER, CER, N, used_blank_id, blank_ratio
+    - Auto-detects blank id on a short warm-up if force_blank_id is None.
+    - If bf16 is on and blank_ratio > 95%, caller can retry in fp32.
+    """
     model.eval()
-    amp = (torch.autocast("cuda", dtype=torch.bfloat16)
-           if (use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
-           else torch.cuda.amp.autocast(enabled=False))
 
-    total_w_edits = 0
-    total_w_tok   = 0
-    total_c_edits = 0
-    total_c_tok   = 0
-    N = 0
+    # ----- warm-up to detect blank id -----
+    blank_id = 0 if force_blank_id is None else int(force_blank_id)
+    needs_auto_blank = force_blank_id is None
+    freq = None
 
-    blank_count = 0
-    total_logits = 0
+    warm_batches = 8  # use a few mini-batches to estimate; cheap and fast
+    checked = 0
+    if needs_auto_blank:
+        freq = torch.zeros(next(iter(model.parameters())).dtype.__class__(1) == 1)  # dummy to keep type
+        # use a real tensor instead of the dtype trick:
+        freq = torch.zeros( max(id2gloss.keys())+1, dtype=torch.long )
 
-    for batch in loader:
-        # training used a tuple return; mirror that via the collate_fn
-        # multi_modal_collate_fn returns:
-        # (images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths)
-        if not isinstance(batch, (tuple, list)) or len(batch) < 7:
-            raise RuntimeError("Unexpected batch format from loader; expected 7-tuple.")
+        autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+                        if (use_bf16 and device.type=="cuda" and torch.cuda.is_bf16_supported())
+                        else torch.cuda.amp.autocast(enabled=False))
+        for b_idx, batch in enumerate(loader):
+            if b_idx >= warm_batches: break
+            images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths = batch
+            images = images.to(device, non_blocking=True)
+            qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
+            keypoints = keypoints.to(device, non_blocking=True) if keypoints is not None else None
+            qgrid_lengths = qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None
+            with autocast_ctx:
+                logits = model(images, qgrids, keypoints, qgrid_lengths)
+            pred = logits.argmax(-1)  # (B,T)
+            vals, counts = pred.unique(return_counts=True)
+            freq[vals.cpu()] += counts.cpu()
+            checked += pred.numel()
 
-        images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths = batch
-        images = images.to(device, non_blocking=True) if images is not None else None
-        qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
-        keypoints = keypoints.to(device, non_blocking=True) if keypoints is not None else None
-        qgrid_lengths = qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None
+        if checked > 0:
+            blank_id = int(freq.argmax().item())
+            # tiny heuristic: if top-1 share is not dominant, keep 0
+            top_share = 100.0 * freq.max().item() / max(1, freq.sum().item())
+            if top_share < 50.0:
+                blank_id = 0
+            print(f"[auto] detected blank_id={blank_id} (top-share ~{top_share:.2f}%)", flush=True)
+        else:
+            print("[auto] could not sample warm-up batches; defaulting blank_id=0", flush=True)
 
-        with amp:
-            logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
-        if logits.dim() != 3:
-            raise RuntimeError(f"Model returned logits with shape {tuple(logits.shape)}, expected (B,T,V).")
+    # ----- full pass -----
+    def do_pass(dtype_bf16: bool) -> Tuple[float,float,int,float]:
+        total_w_edits = total_w_tok = 0
+        total_c_edits = total_c_tok = 0
+        N = 0
+        total_logits = 0
+        blank_hits = 0
 
-        # stats on blanks (after argmax, before collapse)
-        preds = logits.argmax(dim=-1)  # (B,T)
-        blank_count += int((preds == 0).sum().item())
-        total_logits += int(preds.numel())
+        autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+                        if (dtype_bf16 and device.type=="cuda" and torch.cuda.is_bf16_supported())
+                        else torch.cuda.amp.autocast(enabled=False))
+        for batch in loader:
+            images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths = batch
+            images = images.to(device, non_blocking=True)
+            qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
+            keypoints = keypoints.to(device, non_blocking=True) if keypoints is not None else None
+            qgrid_lengths = qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None
 
-        # Greedy collapse and score
-        preds = preds.cpu()
-        labels = labels.cpu()
-        label_lengths = label_lengths.cpu()
+            with autocast_ctx:
+                logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V)
 
-        B, T = preds.shape
-        for b in range(B):
-            hyp_ids = greedy_collapse_blank0(preds[b].tolist())
-            hyp_toks = [id2gloss.get(i, "<UNK>") for i in hyp_ids]
-            hyp_str = " ".join(hyp_toks)
+            pred = logits.argmax(-1).cpu()  # (B,T)
+            blank_hits += int((pred == blank_id).sum().item())
+            total_logits += int(pred.numel())
 
-            L = int(label_lengths[b].item())
-            ref_ids = labels[b, :L].tolist() if L > 0 else []
-            # strip any 0s from references (padding or accidental blanks)
-            ref_ids = [i for i in ref_ids if i != 0]
-            ref_toks = [id2gloss.get(i, "<UNK>") for i in ref_ids]
-            ref_str = " ".join(ref_toks)
+            labels = labels.cpu()
+            label_lengths = label_lengths.cpu()
 
-            hyp_words = hyp_str.split() if hyp_str else []
-            ref_words = ref_str.split() if ref_str else []
-            total_w_edits += edit_distance(hyp_words, ref_words)
-            total_w_tok   += max(1, len(ref_words))
+            B, T = pred.shape
+            for b in range(B):
+                # greedy collapse
+                seq = []
+                prev = None
+                for t in pred[b].tolist():
+                    if t == blank_id:
+                        prev = t; continue
+                    if prev is not None and t == prev:
+                        continue
+                    seq.append(t); prev = t
+                hyp = " ".join(id2gloss.get(int(t), "<UNK>") for t in seq)
 
-            hyp_chars = list(hyp_str)
-            ref_chars = list(ref_str)
-            total_c_edits += edit_distance(hyp_chars, ref_chars)
-            total_c_tok   += max(1, len(ref_chars))
+                L = int(label_lengths[b].item())
+                ref_ids = labels[b, :L].tolist() if L>0 else []
+                # only strip the detected blank_id from refs (not hard-coded 0)
+                ref_ids = [int(t) for t in ref_ids if int(t) != blank_id]
+                ref = " ".join(id2gloss.get(int(t), "<UNK>") for t in ref_ids)
 
-            N += 1
+                # WER/CER
+                hw, rw = hyp.split(), ref.split()
+                # edit distance
+                m, n = len(hw), len(rw)
+                dp = [[0]*(n+1) for _ in range(m+1)]
+                for i in range(m+1): dp[i][0] = i
+                for j in range(n+1): dp[0][j] = j
+                for i in range(1, m+1):
+                    for j in range(1, n+1):
+                        dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1] + (hw[i-1] != rw[j-1]))
+                total_w_edits += dp[m][n]
+                total_w_tok   += max(1, n)
 
-    if total_logits > 0:
-        br = 100.0 * blank_count / total_logits
-        print(f"[debug] blank@argmax ratio: {br:.2f}% ({blank_count}/{total_logits})", flush=True)
+                hc, rc = list(hyp), list(ref)
+                mc, nc = len(hc), len(rc)
+                dp2 = [[0]*(nc+1) for _ in range(mc+1)]
+                for i in range(mc+1): dp2[i][0] = i
+                for j in range(nc+1): dp2[0][j] = j
+                for i in range(1, mc+1):
+                    for j in range(1, nc+1):
+                        dp2[i][j] = min(dp2[i-1][j]+1, dp2[i][j-1]+1, dp2[i-1][j-1] + (hc[i-1] != rc[j-1]))
+                total_c_edits += dp2[mc][nc]
+                total_c_tok   += max(1, nc)
 
-    WER = 100.0 * total_w_edits / max(1, total_w_tok)
-    CER = 100.0 * total_c_edits / max(1, total_c_tok)
-    return WER, CER, N
+                N += 1
+
+        blank_ratio = 100.0 * blank_hits / max(1, total_logits)
+        WER = 100.0 * total_w_edits / max(1, total_w_tok)
+        CER = 100.0 * total_c_edits / max(1, total_c_tok)
+        return WER, CER, N, blank_ratio
+
+    # first pass (requested precision)
+    W1, C1, N1, BR1 = do_pass(use_bf16)
+    print(f"[debug] pass-1 blank@argmax (id={blank_id}): {BR1:.2f}%")
+
+    # auto-retry in fp32 if bf16 collapsed
+    if use_bf16 and BR1 > 95.0:
+        print("[debug] high blank ratio under bf16 — retrying in fp32 once.")
+        W2, C2, N2, BR2 = do_pass(False)
+        print(f"[debug] pass-2 (fp32) blank@argmax (id={blank_id}): {BR2:.2f}%")
+        return W2, C2, N2, blank_id, BR2
+
+    return W1, C1, N1, blank_id, BR1
+
 
 # -------------------------------
 # main
@@ -388,8 +453,9 @@ def main():
 
     # ---- evaluate ----
     use_bf16 = args.bf16 and (device.type == "cuda") and torch.cuda.is_bf16_supported()
-    WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=use_bf16)
-    print(f"[RESULT] N={N}  WER={WER:.2f}%  CER={CER:.2f}%")
+    WER, CER, N, blank_id, blank_ratio = evaluate(model, dl, id2gloss, device, use_bf16=use_bf16)
+    print(f"[RESULT] N={N}  WER={WER:.2f}%  CER={CER:.2f}%  (blank_id={blank_id}, blank@argmax={blank_ratio:.2f}%)")
+
 
 if __name__ == "__main__":
     main()
