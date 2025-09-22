@@ -455,20 +455,19 @@ def main():
         print(f"[head] num_classes={n_classes} (forced)")
     model = MultiModalMamba(num_classes=n_classes).to(device)
 
-    # Load checkpoint (try weights_only when available)
+        # ---------- load checkpoint first (to sniff metadata) ----------
     print(f"[ckpt] loading: {args.ckpt}")
     try:
-        ckpt = torch.load(args.ckpt, map_location=map_location, weights_only=True)  # PyTorch 2.5+
+        ckpt_obj = torch.load(args.ckpt, map_location=map_location, weights_only=True)
     except TypeError:
-        ckpt = torch.load(args.ckpt, map_location=map_location)
+        ckpt_obj = torch.load(args.ckpt, map_location=map_location)
 
-    # Accept common formats
-    state_dict = ckpt.get("state_dict") if isinstance(ckpt, dict) else None
-    if state_dict is None:
-        if isinstance(ckpt, dict) and all(isinstance(k, str) for k in ckpt.keys()):
-            state_dict = ckpt
-        else:
-            state_dict = ckpt.get("model", ckpt.get("model_state", {})) if isinstance(ckpt, dict) else {}
+    # Pull a state_dict-like mapping
+    state_dict = ckpt_obj.get("state_dict") if isinstance(ckpt_obj, dict) else None
+    if state_dict is None and isinstance(ckpt_obj, dict) and all(isinstance(k, str) for k in ckpt_obj.keys()):
+        state_dict = ckpt_obj
+    if state_dict is None and isinstance(ckpt_obj, dict):
+        state_dict = ckpt_obj.get("model", ckpt_obj.get("model_state", {})) or {}
 
     # Strip common prefixes
     def _strip(sd: Dict[str, Any], prefixes=("module.", "model.")):
@@ -482,21 +481,94 @@ def main():
         return out
 
     state_dict = _strip(state_dict)
-    ld = model.load_state_dict(state_dict, strict=False)
 
-    # Report unexpected/missing, but keep going
+    # Try to infer number of classes from the checkpoint head
+    num_classes_ckpt = None
+    for key in ("head.weight", "classifier.weight", "fc.weight", "final_proj.weight"):
+        if key in state_dict and state_dict[key].dim() == 2:
+            num_classes_ckpt = int(state_dict[key].shape[0])
+            break
+
+    # ---------- dataset ----------
+    ds = MultiModalPhoenixDataset(
+        image_prefix=args.image_prefix,
+        qgrid_prefix=args.qgrid_prefix,
+        kp_path=args.kp_path,
+        meta_dir_path=args.meta_dir,
+        gloss_dict_path=args.gloss_dict,
+        split=args.split,
+    )
+
+    # Build id2gloss (prefer from checkpoint if included)
+    id2gloss = None
+    # common fields people save
+    for vocab_key in ("id2gloss", "vocab", "labels", "classes", "gloss_list"):
+        if isinstance(ckpt_obj, dict) and vocab_key in ckpt_obj:
+            raw = ckpt_obj[vocab_key]
+            try:
+                if isinstance(raw, dict):
+                    # normalize to {int_id: str_gloss}
+                    if raw and isinstance(next(iter(raw.keys())), str):
+                        id2gloss = {int(v): str(k) for k, v in raw.items()}
+                    else:
+                        id2gloss = {int(k): str(v) for k, v in raw.items()}
+                else:
+                    seq = list(raw)
+                    id2gloss = {int(i): str(g) for i, g in enumerate(seq)}
+            except Exception:
+                id2gloss = None
+            if id2gloss:
+                break
+
+    if id2gloss is None:
+        # fall back to dataset file
+        id2gloss = load_id2gloss(args.gloss_dict)
+
+    # Decide final num_classes
+    if args.force_num_classes:
+        n_classes = int(args.force_num_classes)
+        print(f"[head] num_classes={n_classes} (forced)")
+    elif num_classes_ckpt is not None:
+        n_classes = num_classes_ckpt
+        print(f"[head] num_classes={n_classes} (from checkpoint)")
+    else:
+        n_classes = len(id2gloss)
+        print(f"[head] num_classes={n_classes} (from id2gloss)")
+
+    # Sanity check: id2gloss length vs head
+    if len(id2gloss) != n_classes:
+        raise RuntimeError(
+            f"Vocab size mismatch: id2gloss={len(id2gloss)} vs head={n_classes}. "
+            f"Use the same gloss_dict the checkpoint was trained with, or remove --force_num_classes."
+        )
+
+    # ---------- dataloader ----------
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_mm,
+    )
+
+    # ---------- model ----------
+    model = MultiModalMamba(num_classes=n_classes).to(device)
+
+    # Load weights (now shapes should match)
+    ld = model.load_state_dict(state_dict, strict=False)
     missing = getattr(ld, "missing_keys", None) or (ld.get("missing_keys", []) if isinstance(ld, dict) else [])
     unexpected = getattr(ld, "unexpected_keys", None) or (ld.get("unexpected_keys", []) if isinstance(ld, dict) else [])
     if unexpected:
-        print(f"[ckpt] strict load failed with unexpected keys ({len(unexpected)}). "
-              f"Loading non-head layers and reinitializing classifier.")
+        print(f"[ckpt] unexpected keys: {len(unexpected)}")
     if missing:
         print(f"[ckpt] missing keys: {len(missing)}")
 
-    # Patch frame encoder to accept (B, T, C, H, W)
+    # Frame encoder adapter
     if not isinstance(model.frame_encoder, _FrameEncoderAdapter):
         model.frame_encoder = _FrameEncoderAdapter(model.frame_encoder)
     print("[patch] FrameEncoderAdapter attached.")
+
 
     # Eval
     WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=bool(args.bf16))
