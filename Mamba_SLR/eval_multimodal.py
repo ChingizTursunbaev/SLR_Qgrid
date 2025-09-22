@@ -1,12 +1,7 @@
-# eval_multimodal.py
-# Evaluation script aligned with your dataset/model code.
-# - Unpacks 7-tuple batches from multi_modal_collate_fn
-# - Adapts frame encoder to (B,T,C,H,W) -> (B,T,D)
-# - Greedy CTC decode (blank=0) for WER/CER
+# eval_multimodal.py — final: head-name remap, lazy-mat before load, tuple-collate match
 
-import argparse
-import warnings
-from typing import Dict, Any, Optional, Tuple
+import argparse, warnings, re
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -17,276 +12,229 @@ from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset, multi_mo
 from slr.models.multi_modal_model import MultiModalMamba
 
 
-# -------------------------------
-# Frame-encoder adapter (5D -> sequence)
-# -------------------------------
+# ---------- Frame encoder adapter ----------
 class FrameEncoder5D(nn.Module):
-    """
-    Wraps a per-frame encoder E that expects (B*T, C, H, W) and returns (B*T, D),
-    to make it accept (B, T, C, H, W) and return (B, T, D).
-    """
+    """Make per-frame encoder E((B*T,C,H,W)->(B*T,D)) accept (B,T,C,H,W)->(B,T,D)."""
     def __init__(self, enc: nn.Module):
         super().__init__()
         self.enc = enc
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
-            raise RuntimeError(f"FrameEncoder5D expects 5D (B,T,C,H,W), got {tuple(x.shape)}")
-        B, T, C, H, W = x.shape
-        x_bt = x.reshape(B * T, C, H, W).contiguous()
-        y_bt = self.enc(x_bt)  # (B*T, D) or (B*T, P, D)->avg pooled inside enc
-        if y_bt.dim() == 2:
-            y = y_bt.view(B, T, -1)
-        elif y_bt.dim() == 3:
-            y = y_bt.mean(dim=1).view(B, T, -1)
-        else:
-            raise RuntimeError(f"Unexpected frame encoder output {tuple(y_bt.shape)}")
-        return y
+            raise RuntimeError(f"FrameEncoder5D needs (B,T,C,H,W), got {tuple(x.shape)}")
+        B,T,C,H,W = x.shape
+        y = self.enc(x.reshape(B*T, C, H, W))
+        if y.dim() == 2:
+            return y.view(B, T, -1)
+        if y.dim() == 3:
+            return y.mean(dim=1).view(B, T, -1)
+        raise RuntimeError(f"Unexpected frame encoder output {tuple(y.shape)}")
 
 
-# -------------------------------
-# Robust gloss map loader
-# -------------------------------
+# ---------- Gloss map ----------
 def load_id2gloss(gloss_dict_path: str) -> Dict[int, str]:
     raw = np.load(gloss_dict_path, allow_pickle=True)
     try:
         obj = raw.item()
     except Exception:
         obj = raw
-
-    id2gloss: Dict[int, str] = {}
+    id2 = {}
     if isinstance(obj, dict):
-        # Could be {gloss:str -> id:int} OR {id:int -> gloss:str}
         k0 = next(iter(obj.keys())) if obj else None
         v0 = obj[k0] if obj else None
         if isinstance(k0, str) and isinstance(v0, (int, np.integer)):
-            for g, i in obj.items():
-                id2gloss[int(i)] = str(g)
+            for g, i in obj.items(): id2[int(i)] = str(g)
         elif isinstance(k0, (int, np.integer)) and isinstance(v0, str):
-            for i, g in obj.items():
-                id2gloss[int(i)] = str(g)
+            for i, g in obj.items(): id2[int(i)] = str(g)
         else:
-            # fallback: coerce
             for k, v in obj.items():
-                try:
-                    i = int(k); g = str(v)
-                except Exception:
-                    i = int(v); g = str(k)
-                id2gloss[i] = g
+                try: i, g = int(k), str(v)
+                except: i, g = int(v), str(k)
+                id2[i] = g
     else:
-        # treat as list/array: index -> gloss
-        seq = list(obj)
-        for i, g in enumerate(seq):
-            id2gloss[int(i)] = str(g)
-
-    # ensure blank at 0
-    if 0 not in id2gloss:
-        id2gloss[0] = "<blank>"
-    return id2gloss
+        for i, g in enumerate(list(obj)): id2[int(i)] = str(g)
+    id2.setdefault(0, "<blank>")
+    return id2
 
 
-# -------------------------------
-# Decoding + metrics
-# -------------------------------
+# ---------- Decode + metrics ----------
 def collapse_ctc(ids, blank=0):
-    out = []
-    prev = None
+    out, prev = [], None
     for t in ids:
         t = int(t)
-        if t == blank:
-            prev = t
-            continue
-        if prev is not None and t == prev:
-            continue
-        out.append(t)
-        prev = t
+        if t == blank: prev = t; continue
+        if prev is not None and t == prev: continue
+        out.append(t); prev = t
     return out
 
 def edit_distance(a, b):
-    # a, b: lists of tokens (words or chars)
     m, n = len(a), len(b)
     dp = [[0]*(n+1) for _ in range(m+1)]
     for i in range(m+1): dp[i][0] = i
     for j in range(n+1): dp[0][j] = j
-    for i in range(1, m+1):
+    for i in range(1,m+1):
         ai = a[i-1]
-        for j in range(1, n+1):
-            cost = 0 if ai == b[j-1] else 1
-            dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
+        for j in range(1,n+1):
+            dp[i][j] = min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1] + (ai!=b[j-1]))
     return dp[m][n]
 
-
 @torch.no_grad()
-def evaluate(model: nn.Module,
-             dl: DataLoader,
-             id2gloss: Dict[int, str],
-             device: str,
-             use_bf16: bool = False) -> Tuple[float, float, int]:
-
+def evaluate(model: nn.Module, dl: DataLoader, id2gloss: Dict[int,str], device: str, use_bf16: bool) -> Tuple[float,float,int]:
     model.eval()
-    blank = 0
-
-    total_wer_edits = 0
-    total_wer_tokens = 0
-    total_cer_edits = 0
-    total_cer_chars = 0
-    total_samples = 0
-
-    use_cuda_bf16 = (use_bf16 and device.startswith("cuda"))
-    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if use_cuda_bf16 else torch.cuda.amp.autocast(enabled=False))
-
+    total_wer_e = total_wer_t = total_cer_e = total_cer_c = N = 0
+    autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+                    if (use_bf16 and device.startswith("cuda")) else torch.cuda.amp.autocast(enabled=False))
     for batch in dl:
-        # Dataset collate returns a 7-tuple:
+        # Your collate returns a 7-tuple:
         # (images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths)
-        images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths = batch
-
-        images = images.to(device, non_blocking=True)          # (B,T,C,H,W)
-        qgrids = qgrids.to(device, non_blocking=True)          # (B,Tq,242)
-        keypoints = keypoints.to(device, non_blocking=True)    # (B,T,242)
-        qgrid_lengths = qgrid_lengths.to(device, non_blocking=True)
+        images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths = batch  # :contentReference[oaicite:3]{index=3}
+        images = images.to(device, non_blocking=True)
+        qgrids = qgrids.to(device, non_blocking=True) if qgrids is not None else None
+        keypoints = keypoints.to(device, non_blocking=True) if keypoints is not None else None
+        qgrid_lengths = qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None
 
         with autocast_ctx:
-            logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T',V)
+            logits = model(images, qgrids, keypoints, qgrid_lengths)  # (B,T,V) :contentReference[oaicite:4]{index=4}
+        pred = logits.argmax(-1).cpu()
+        labels = labels.cpu()
 
-        pred_ids = logits.argmax(dim=-1).cpu()  # (B, T')
+        for b in range(pred.size(0)):
+            hyp_ids = collapse_ctc(pred[b].tolist(), blank=0)
+            hyp = " ".join(id2gloss.get(t, "<UNK>") for t in hyp_ids)
+            ref_ids = [int(t) for t in labels[b].tolist() if int(t) != 0]
+            ref = " ".join(id2gloss.get(t, "<UNK>") for t in ref_ids)
 
-        # Build reference strings from label ids: ignore 0 (blank)
-        labels_cpu = labels.cpu()
-        B = pred_ids.size(0)
-        for b in range(B):
-            hyp_seq = collapse_ctc(pred_ids[b].tolist(), blank=blank)
-            hyp_tokens = [id2gloss.get(t, "<UNK>") for t in hyp_seq]
-            hyp_str = " ".join(hyp_tokens)
+            total_wer_e += edit_distance(hyp.split(), ref.split())
+            total_wer_t += max(1, len(ref.split()))
+            total_cer_e += edit_distance(list(hyp), list(ref))
+            total_cer_c += max(1, len(ref))
+            N += 1
 
-            ref_ids = [int(t) for t in labels_cpu[b].tolist() if int(t) != blank]
-            ref_tokens = [id2gloss.get(t, "<UNK>") for t in ref_ids]
-            ref_str = " ".join(ref_tokens)
-
-            # WER
-            wer_ed = edit_distance(hyp_str.split(), ref_str.split())
-            total_wer_edits += wer_ed
-            total_wer_tokens += max(1, len(ref_str.split()))
-
-            # CER
-            cer_ed = edit_distance(list(hyp_str), list(ref_str))
-            total_cer_edits += cer_ed
-            total_cer_chars += max(1, len(ref_str))
-
-            total_samples += 1
-
-    WER = 100.0 * total_wer_edits / max(1, total_wer_tokens)
-    CER = 100.0 * total_cer_edits / max(1, total_cer_chars)
-    return WER, CER, total_samples
+    WER = 100.0 * total_wer_e / max(1, total_wer_t)
+    CER = 100.0 * total_cer_e / max(1, total_cer_c)
+    return WER, CER, N
 
 
-# -------------------------------
-# Args
-# -------------------------------
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True, type=str, help="Path to checkpoint .pt/.pth")
+# ---------- ckpt utils ----------
+def strip_prefixes(sd: Dict[str, torch.Tensor], prefixes=("module.", "model.")) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k,v in sd.items():
+        nk = k
+        for p in prefixes:
+            if nk.startswith(p): nk = nk[len(p):]
+        out[nk] = v
+    return out
 
-    # keep your defaults here only if needed at runtime; dataset itself discovers from meta
-    p.add_argument("--image_prefix", default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
-    p.add_argument("--qgrid_prefix", default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
-    p.add_argument("--kp_path",      default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
-    p.add_argument("--meta_dir",     default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
-    p.add_argument("--gloss_dict",   default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
-    p.add_argument("--split", choices=["train", "val", "dev", "test"], default="test")
+def find_head_prefix(sd: Dict[str, torch.Tensor]) -> Optional[str]:
+    for p in ("classifier","ctc_head","head","fc","final_proj"):
+        if f"{p}.weight" in sd and sd[f"{p}.weight"].dim()==2:
+            return p
+    return None
 
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--bf16", action="store_true")
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--max_kv", type=int, default=512, help="Max pooled KV length for qgrid/keypoints")
-    return p.parse_args()
+def remap_head(sd: Dict[str, torch.Tensor], src: str, dst: str) -> Dict[str, torch.Tensor]:
+    if src == dst: return sd
+    rem = {}
+    for k,v in sd.items():
+        if k.startswith(src + "."):
+            rem[f"{dst}.{k[len(src)+1:]}"] = v
+        else:
+            rem[k] = v
+    return rem
 
 
-# -------------------------------
-# Main
-# -------------------------------
+# ---------- args ----------
+def get_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True)
+    # paths (keep your defaults)
+    ap.add_argument("--image_prefix", default="/shared/home/xvoice/nirmal/SlowFastSign/dataset/phoenix2014/phoenix-2014-multisigner/features/fullFrame-256x256px")
+    ap.add_argument("--qgrid_prefix", default="/shared/home/xvoice/Chingiz/datasets/Qgrid_npy")
+    ap.add_argument("--kp_path",      default="/shared/home/xvoice/Chingiz/datasets/phoenix-2014-keypoints_hrnet-filtered_SMOOTH_v2-256x256.pkl")
+    ap.add_argument("--meta_dir",     default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014")
+    ap.add_argument("--gloss_dict",   default="/shared/home/xvoice/Chingiz/SLR_Qgrid/Mamba_SLR/data/phoenix2014/gloss_dict_normalized.npy")
+    ap.add_argument("--split", choices=["train","val","dev","test"], default="test")
+
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--max_kv", type=int, default=1024)  # match training default :contentReference[oaicite:5]{index=5}
+    return ap.parse_args()
+
+
+# ---------- main ----------
 def main():
-    args = parse_args()
+    args = get_args()
     warnings.filterwarnings("once", category=FutureWarning)
-
     device = args.device
     map_location = torch.device(device)
 
-    # Dataset (uses robust pre-resolution & 7-tuple collate)
+    # Dataset + loader (same collate as training)
     ds = MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix,
-        qgrid_prefix=args.qgrid_prefix,
-        kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,
-        gloss_dict_path=args.gloss_dict,
-        split=args.split if args.split != "val" else "dev",
+        image_prefix=args.image_prefix, qgrid_prefix=args.qgrid_prefix, kp_path=args.kp_path,
+        meta_dir_path=args.meta_dir, gloss_dict_path=args.gloss_dict,
+        split=("dev" if args.split=="val" else args.split),
     )
-    dl = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=multi_modal_collate_fn,
-    )
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                    num_workers=args.num_workers, pin_memory=True,
+                    collate_fn=multi_modal_collate_fn, drop_last=False)  # :contentReference[oaicite:6]{index=6}
 
-    # id2gloss (+ ensure blank=0)
-    id2gloss = getattr(ds, "id_to_gloss", None)
-    if not isinstance(id2gloss, dict) or len(id2gloss) == 0:
-        id2gloss = load_id2gloss(args.gloss_dict)
-    if 0 not in id2gloss:
-        id2gloss[0] = "<blank>"
+    # id2gloss (+blank)
+    id2gloss = load_id2gloss(args.gloss_dict)
     num_classes = max(id2gloss.keys()) + 1
     print(f"[head] num_classes={num_classes} (from gloss_dict + blank)")
 
-    # Model
-    model = MultiModalMamba(num_classes=num_classes, max_kv=args.max_kv)
-    # Adapt frame encoder for 5D input -> (B,T,D)
-    model.frame_encoder = FrameEncoder5D(model.frame_encoder)
+    # Build model w/ same defaults as training script
+    model = MultiModalMamba(num_classes=num_classes, max_kv=args.max_kv)  # :contentReference[oaicite:7]{index=7}
+    model.frame_encoder = FrameEncoder5D(model.frame_encoder)             # (B,T,C,H,W)->(B,T,D) :contentReference[oaicite:8]{index=8}
     model = model.to(device)
 
-    # Load checkpoint (lenient)
+    # -------- 1) Materialize LazyLinear with a dummy forward BEFORE loading --------
+    try:
+        first = next(iter(dl))
+        images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths = first
+        with torch.no_grad():
+            _ = model(
+                images.to(device, non_blocking=True),
+                qgrids.to(device, non_blocking=True) if qgrids is not None else None,
+                keypoints.to(device, non_blocking=True) if keypoints is not None else None,
+                qgrid_lengths.to(device, non_blocking=True) if qgrid_lengths is not None else None,
+            )
+    except StopIteration:
+        pass
+
+    # -------- 2) Load checkpoint (strip DDP prefixes, remap head name) --------
     print(f"[ckpt] loading: {args.ckpt}")
     try:
         ckpt = torch.load(args.ckpt, map_location=map_location, weights_only=True)
     except TypeError:
         ckpt = torch.load(args.ckpt, map_location=map_location)
 
-    state_dict = ckpt.get("state_dict") if isinstance(ckpt, dict) else None
-    if state_dict is None:
-        if isinstance(ckpt, dict) and all(isinstance(k, str) for k in ckpt.keys()):
-            state_dict = ckpt
-        else:
-            state_dict = ckpt.get("model", ckpt.get("model_state", {})) if isinstance(ckpt, dict) else {}
+    sd = None
+    if isinstance(ckpt, dict):
+        sd = ckpt.get("state_dict") or ckpt.get("model") or ckpt.get("model_state")
+        if sd is None and all(isinstance(k, str) for k in ckpt.keys()):
+            sd = ckpt
+    if sd is None:
+        sd = {}
+    sd = strip_prefixes(sd)
 
-    # strip DDP prefixes
-    def _strip(sd: Dict[str, Any], prefixes=("module.", "model.")):
-        out = {}
-        for k, v in sd.items():
-            nk = k
-            for p in prefixes:
-                if nk.startswith(p):
-                    nk = nk[len(p):]
-            out[nk] = v
-        return out
+    head_src = find_head_prefix(sd)
+    if head_src and head_src != "classifier":
+        sd = remap_head(sd, head_src, "classifier")
 
-    ld = model.load_state_dict(_strip(state_dict), strict=False)
+    ld = model.load_state_dict(sd, strict=False)
     missing = list(getattr(ld, "missing_keys", []))
     unexpected = list(getattr(ld, "unexpected_keys", []))
-    if unexpected:
-        print(f"[ckpt] unexpected keys: {len(unexpected)}")
-    if missing:
-        print(f"[ckpt] missing keys: {len(missing)}")
+    if unexpected: print(f"[ckpt] unexpected keys: {len(unexpected)}")
+    if missing:    print(f"[ckpt] missing keys: {len(missing)}")
 
-    # Optional: sanity check whether classifier loaded (don’t crash; just warn)
-    head_keys = {"classifier.weight", "classifier.bias"}
-    if any(k in missing for k in head_keys):
-        print("[warn] Classifier head did not fully load from checkpoint. "
-              "If vocab differs from training, WER/CER will be high.")
+    # Warn if head still didn’t load
+    if ("classifier.weight" in missing) or ("classifier.bias" in missing):
+        print("[warn] Classifier head did not fully load from checkpoint. Vocab/arch mismatch will tank WER.")
 
-    # Evaluate
-    WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=bool(args.bf16))
+    # -------- 3) Eval --------
+    use_bf16 = bool(args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16)
     print(f"[RESULT] N={N}  WER={WER:.2f}%  CER={CER:.2f}%")
 
 
