@@ -180,33 +180,111 @@ def main():
     map_location = torch.device(device)
 
     # Dataset & loader (use the SAME collate as training)
+    # ---------- DATASET ----------
     ds = MultiModalPhoenixDataset(
-        image_prefix=args.image_prefix, qgrid_prefix=args.qgrid_prefix, kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir, gloss_dict_path=args.gloss_dict, split=args.split,
+        image_prefix=args.image_prefix,
+        qgrid_prefix=args.qgrid_prefix,
+        kp_path=args.kp_path,
+        meta_dir_path=args.meta_dir,
+        gloss_dict_path=args.gloss_dict,
+    split=args.split,
     )
     id2gloss = getattr(ds, "id_to_gloss", None) or getattr(ds, "id2gloss", None)
-    if not isinstance(id2gloss, dict) or len(id2gloss)==0:
+    if not isinstance(id2gloss, dict) or len(id2gloss) == 0:
         id2gloss = load_id2gloss(args.gloss_dict)
-    n_classes = len(id2gloss)
 
+    # ---------- LOAD CKPT FIRST (to sniff shapes & names) ----------
+    print(f"[ckpt] loading: {args.ckpt}")
+    try:
+        ckpt_obj = torch.load(args.ckpt, map_location=map_location, weights_only=True)
+    except TypeError:
+        ckpt_obj = torch.load(args.ckpt, map_location=map_location)
+
+    # extract state_dict + strip prefixes
+    state_dict = ckpt_obj.get("state_dict") if isinstance(ckpt_obj, dict) else None
+    if state_dict is None and isinstance(ckpt_obj, dict) and all(isinstance(k, str) for k in ckpt_obj.keys()):
+        state_dict = ckpt_obj
+    if state_dict is None and isinstance(ckpt_obj, dict):
+        state_dict = ckpt_obj.get("model", ckpt_obj.get("model_state", {})) or {}
+
+    def _strip(sd: Dict[str, Any], prefixes=("module.", "model.")):
+        out = {}
+        for k, v in sd.items():
+            nk = k
+            for p in prefixes:
+                if nk.startswith(p):
+                    nk = nk[len(p):]
+            out[nk] = v
+        return out
+
+    state_dict = _strip(state_dict)
+
+    # ---------- INFER N_LAYER & HEAD FROM CKPT ----------
+    import re
+    layer_ids = []
+    for k in state_dict.keys():
+        m = re.search(r"frame_encoder\.layers\.(\d+)\.", k)
+        if m:
+            layer_ids.append(int(m.group(1)))
+    n_layer_infer = (max(layer_ids) + 1) if layer_ids else args.n_layer
+
+    head_key_candidates = ["head.weight", "classifier.weight", "fc.weight", "final_proj.weight"]
+    head_key_in_ckpt = None
+    num_classes_ckpt = None
+    for hk in head_key_candidates:
+        if hk in state_dict and state_dict[hk].dim() == 2:
+            head_key_in_ckpt = hk
+            num_classes_ckpt = int(state_dict[hk].shape[0])
+            break
+
+    # pick num_classes
+    n_classes = num_classes_ckpt if num_classes_ckpt is not None else len(id2gloss)
+    print(f"[head] num_classes={n_classes} ({'from checkpoint' if num_classes_ckpt is not None else 'from id2gloss'})")
+    print(f"[arch] n_layer inferred from ckpt: {n_layer_infer}")
+
+    # ---------- DATALOADER ----------
+    from slr.datasets.multi_modal_datasets import multi_modal_collate_fn
     dl = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
         collate_fn=multi_modal_collate_fn, drop_last=False,
     )
 
-    # Model — mirror training hparams
+    # ---------- BUILD MODEL with inferred depth ----------
     model = MultiModalMamba(
-        d_model=args.d_model, n_layer=args.n_layer,
-        fusion_embed=args.fusion_embed, fusion_heads=args.fusion_heads,
-        num_classes=n_classes, max_kv=args.max_kv, pool_mode=args.pool_mode,
+        d_model=args.d_model,
+        n_layer=n_layer_infer,                 # <- important
+        fusion_embed=args.fusion_embed,
+        fusion_heads=args.fusion_heads,
+        num_classes=n_classes,
+        max_kv=args.max_kv,
+        pool_mode=args.pool_mode,
     ).to(device)
-    wrap_frame_encoder_for_5d(model)
+    # allow (B,T,C,H,W) into frame encoder
+    def _wrap_fe(m: nn.Module):
+        fe = m.frame_encoder
+        orig_forward = fe.forward
+        def adapter(x: torch.Tensor, *a, **kw):
+            if x.dim() == 4:
+                return orig_forward(x, *a, **kw)
+            if x.dim() == 5:
+                B,T,C,H,W = x.shape
+                y = orig_forward(x.view(B*T, C, H, W), *a, **kw)
+                if y.dim()==2: return y.view(B,T,-1)
+                if y.dim()==3: return y.mean(dim=1).view(B,T,-1)
+                raise RuntimeError(f"Unexpected frame_encoder output {tuple(y.shape)}")
+            raise RuntimeError(f"frame_encoder input must be 4D/5D, got {tuple(x.shape)}")
+        fe.forward = adapter
+    _wrap_fe(model)
 
-    # ---- MATERIALIZE lazy layers BEFORE loading weights (like training) ----
+    # ---------- OPTIONAL: materialize lazies by 1 dummy forward (safer loads) ----------
     try:
         first_batch = next(iter(dl))
-        b0 = unpack_batch(first_batch)
+        def _unpack(b):
+            if isinstance(b, dict): return b
+            (images, qgrids, keypoints, labels, image_lengths, label_lengths, qgrid_lengths) = b
+            return {"images": images, "qgrids": qgrids, "keypoints": keypoints, "qgrid_lengths": qgrid_lengths}
+        b0 = _unpack(first_batch)
         with torch.no_grad():
             _ = model(
                 b0["images"].to(device, non_blocking=True),
@@ -217,44 +295,44 @@ def main():
     except StopIteration:
         pass
 
-    # Load checkpoint
-    print(f"[ckpt] loading: {args.ckpt}")
-    try:
-        ckpt_obj = torch.load(args.ckpt, map_location=map_location, weights_only=True)
-    except TypeError:
-        ckpt_obj = torch.load(args.ckpt, map_location=map_location)
+    # ---------- REMAP HEAD NAMES IF NEEDED ----------
+    # model expects 'head.*'. If ckpt used 'classifier.*' or 'fc.*' or 'final_proj.*', rename to 'head.*'
+    def _remap_head_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
+        if head_key_in_ckpt is None:
+            return sd
+        head_prefix = head_key_in_ckpt.rsplit(".weight", 1)[0]  # e.g., 'classifier' or 'fc' or 'final_proj' or 'head'
+        if head_prefix == "head":
+            return sd  # matches already
+        remapped = {}
+        for k, v in sd.items():
+            if k.startswith(head_prefix + "."):
+                remapped["head." + k[len(head_prefix) + 1:]] = v
+            else:
+                remapped[k] = v
+        return remapped
 
-    # state_dict extract + strip prefixes
-    state_dict = ckpt_obj.get("state_dict") if isinstance(ckpt_obj, dict) else None
-    if state_dict is None and isinstance(ckpt_obj, dict) and all(isinstance(k, str) for k in ckpt_obj.keys()):
-        state_dict = ckpt_obj
-    if state_dict is None and isinstance(ckpt_obj, dict):
-        state_dict = ckpt_obj.get("model", ckpt_obj.get("model_state", {})) or {}
-    def _strip(sd: Dict[str, Any], prefixes=("module.", "model.")):
-        out = {}
-        for k,v in sd.items():
-            nk = k
-            for p in prefixes:
-                if nk.startswith(p): nk = nk[len(p):]
-            out[nk]=v
-        return out
-    state_dict = _strip(state_dict)
+    state_dict = _remap_head_keys(state_dict)
 
+    # ---------- LOAD WEIGHTS ----------
     ld = model.load_state_dict(state_dict, strict=False)
     missing = getattr(ld, "missing_keys", None) or (ld.get("missing_keys", []) if isinstance(ld, dict) else [])
     unexpected = getattr(ld, "unexpected_keys", None) or (ld.get("unexpected_keys", []) if isinstance(ld, dict) else [])
-    if unexpected: print(f"[ckpt] unexpected keys: {len(unexpected)}")
-    if missing:    print(f"[ckpt] missing keys: {len(missing)}")
-    # Make classifier head loading mandatory:
-    if any((k.startswith("classifier.") or k.startswith("head.") or k.startswith("fc.")) for k in missing):
-        raise RuntimeError("Classifier head from checkpoint did not load. Ensure model hparams & vocab match training.")
+    if unexpected:
+        print(f"[ckpt] unexpected keys: {len(unexpected)}")
+    if missing:
+        print(f"[ckpt] missing keys: {len(missing)}")
 
-    # Recreate loader iterator fresh (since we consumed one batch for materialization)
+    # Make classifier head loading mandatory AFTER remap
+    if any(k.startswith("head.") for k in missing):
+        raise RuntimeError("Classifier head still did not load after remap — model hparams (d_model etc.) likely differ.")
+
+    # (rebuild fresh loader to start eval from the first batch)
     dl = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
         collate_fn=multi_modal_collate_fn, drop_last=False,
     )
+
 
     use_bf16 = bool(args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
     WER, CER, N = evaluate(model, dl, id2gloss, device, use_bf16=use_bf16, blank_idx=args.blank_idx)
