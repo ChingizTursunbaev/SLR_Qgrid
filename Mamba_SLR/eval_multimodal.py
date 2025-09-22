@@ -1,10 +1,11 @@
 # eval_multimodal.py
 # Uses your exact path defaults + robust id2gloss loading from gloss_dict
-# Adds a small adapter so frame_encoder can take (B,T,C,H,W) -> (B,T,D)
+# Adds an adapter so frame_encoder can take (B,T,C,H,W) -> (B,T,D)
+# Pads variable-length sequences via a custom collate_fn that supports tuple/dict samples.
 
 import argparse
 import warnings
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -14,13 +15,10 @@ from torch.utils.data import DataLoader
 from slr.datasets.multi_modal_datasets import MultiModalPhoenixDataset
 from slr.models.multi_modal_model import MultiModalMamba
 
-import torch
-import torch.nn as nn
-from typing import Dict, Any, Optional, List
 
-import torch
-from typing import Dict, Any, Optional, List, Tuple
-
+# -------------------------------
+# Collate helpers (pad variable T)
+# -------------------------------
 def _pad_time(x: torch.Tensor, T: int, time_dim: int) -> torch.Tensor:
     if x.shape[time_dim] == T:
         return x
@@ -41,7 +39,6 @@ def _to_TCHW(img: torch.Tensor) -> torch.Tensor:
     return img  # already (T,C,H,W)
 
 def _infer_T_from_images(img: torch.Tensor) -> int:
-    # Works for (C,T,H,W) or (T,C,H,W)
     if img.ndim != 4:
         raise RuntimeError(f"Expected image tensor 4D, got {tuple(img.shape)}")
     if img.shape[0] in (1, 3):  # (C,T,H,W)
@@ -65,36 +62,33 @@ def _sample_to_dict(sample: Any) -> Dict[str, Any]:
 
     for x in sample:
         if isinstance(x, torch.Tensor):
-            if x.ndim == 4 and 'images' not in out:
-                out['images'] = x  # (C,T,H,W) or (T,C,H,W)
+            if x.ndim == 4 and "images" not in out:
+                out["images"] = x  # (C,T,H,W) or (T,C,H,W)
                 continue
             if x.ndim == 3:
                 # Heuristic: keypoints typically (T,J,D) with small D (2/3/4/6)
-                # If last dim small (<=6) and middle reasonably large, call it keypoints
-                if x.shape[-1] in (2, 3, 4, 6) and x.shape[1] >= 8 and 'keypoints' not in out:
-                    out['keypoints'] = x
-                elif 'qgrids' not in out:
-                    out['qgrids'] = x  # assume (T,Hq,Wq) or (Hq,Wq,T)
+                if x.shape[-1] in (2, 3, 4, 6) and x.shape[1] >= 8 and "keypoints" not in out:
+                    out["keypoints"] = x
+                elif "qgrids" not in out:
+                    out["qgrids"] = x  # assume (T,Hq,Wq) or (Hq,Wq,T)
                 else:
                     others.append(x)
                 continue
-            if x.ndim == 1 and 'qgrid_lengths' not in out and x.numel() == 1:
-                out['qgrid_lengths'] = x  # scalar len as 1D
+            if x.ndim == 1 and "qgrid_lengths" not in out and x.numel() == 1:
+                out["qgrid_lengths"] = x  # scalar len as 1D
                 continue
-        # non-tensor or unclassified → keep
         others.append(x)
 
     # Try to attach common label-ish fields from leftovers
-    # e.g., a tensor of ids, or list/str tokens
     for x in others:
-        if isinstance(x, torch.Tensor) and x.ndim == 1 and 'gloss_ids' not in out:
-            out['gloss_ids'] = x
-        elif isinstance(x, (list, tuple)) and 'gloss_str' not in out:
-            out['gloss_str'] = list(x)
-        elif isinstance(x, str) and 'gloss_str' not in out:
-            out['gloss_str'] = x
+        if isinstance(x, torch.Tensor) and x.ndim == 1 and "gloss_ids" not in out:
+            out["gloss_ids"] = x
+        elif isinstance(x, (list, tuple)) and "gloss_str" not in out:
+            out["gloss_str"] = list(x)
+        elif isinstance(x, str) and "gloss_str" not in out:
+            out["gloss_str"] = x
 
-    if 'images' not in out:
+    if "images" not in out:
         raise RuntimeError("Sample has no images tensor (4D)")
 
     return out
@@ -107,7 +101,7 @@ def collate_mm(batch: List[Any]) -> Dict[str, Any]:
       qgrids: (B,T,...) or None
       keypoints: (B,T,J,D) or None
       qgrid_lengths: (B,)
-      labels (gloss_ids/gloss_str) if present
+      + labels (gloss_ids/gloss_str/labels) if present
     """
     batch_norm = [_sample_to_dict(s) for s in batch]
 
@@ -126,7 +120,9 @@ def collate_mm(batch: List[Any]) -> Dict[str, Any]:
 
     for i, s in enumerate(batch_norm):
         # Images → (T,C,H,W) then pad
-        img = s.get("images") or s.get("frames")
+        img = s.get("images")
+        if img is None:
+            img = s.get("frames")
         img_TCHW = _to_TCHW(img)
         img_TCHW = _pad_time(img_TCHW, T_max, time_dim=0)
         images_list.append(img_TCHW)
@@ -142,7 +138,6 @@ def collate_mm(batch: List[Any]) -> Dict[str, Any]:
             elif qg.shape[-1] == Ts[i]:
                 qgT = qg.permute(2, 0, 1).contiguous()
             else:
-                # fallback: assume first is time
                 qgT = qg
             qgT = _pad_time(qgT, T_max, time_dim=0)
             qgrids_list.append(qgT)
@@ -162,6 +157,7 @@ def collate_mm(batch: List[Any]) -> Dict[str, Any]:
             keypts_list.append(None)
 
     images = torch.stack(images_list, dim=0)       # (B,T,C,H,W)
+
     qgrids = None
     if any(q is not None for q in qgrids_list):
         first = next(q for q in qgrids_list if q is not None)
@@ -261,19 +257,17 @@ def load_id2gloss(gloss_dict_path: str) -> Dict[int, str]:
     Supports both:
       - dict: {gloss(str) -> id(int)}  or  {id(int) -> gloss(str)}
       - list/array: index -> gloss
-    Always returns a mapping {id(int) -> gloss(str)} and inserts id=0 as '<blank>'
-    if not present.
+    Always returns a mapping {id(int) -> gloss(str)} and ensures id 0 exists.
     """
     obj = np.load(gloss_dict_path, allow_pickle=True)
     try:
-        obj = obj.item()  # if it's a dict saved via np.save
+        obj = obj.item()
     except Exception:
         pass
 
     id2gloss: Dict[int, str] = {}
 
     if isinstance(obj, dict):
-        # Detect orientation
         # Case A: keys are strings (gloss), values ints (id)
         if obj and isinstance(next(iter(obj.keys())), str) and isinstance(next(iter(obj.values())), (int, np.integer)):
             for g, i in obj.items():
@@ -283,25 +277,20 @@ def load_id2gloss(gloss_dict_path: str) -> Dict[int, str]:
             for i, g in obj.items():
                 id2gloss[int(i)] = str(g)
         else:
-            # Fallback: try to coerce
+            # Fallback: attempt coercion
             for k, v in obj.items():
                 try:
-                    i = int(k)
-                    g = str(v)
+                    i = int(k); g = str(v)
                 except Exception:
-                    i = int(v)
-                    g = str(k)
+                    i = int(v); g = str(k)
                 id2gloss[i] = g
     else:
-        # Assume sequence-like container of gloss strings
         arr = list(obj)
         for i, g in enumerate(arr):
             id2gloss[int(i)] = str(g)
 
-    # Ensure blank at index 0
     if 0 not in id2gloss:
         id2gloss[0] = "<blank>"
-
     return id2gloss
 
 
@@ -348,23 +337,16 @@ def evaluate(model: nn.Module,
     def edit_distance(a, b):
         m, n = len(a), len(b)
         dp = [[0] * (n + 1) for _ in range(m + 1)]
-        for i in range(m + 1):
-            dp[i][0] = i
-        for j in range(n + 1):
-            dp[0][j] = j
+        for i in range(m + 1): dp[i][0] = i
+        for j in range(n + 1): dp[0][j] = j
         for i in range(1, m + 1):
             for j in range(1, n + 1):
                 cost = 0 if a[i - 1] == b[j - 1] else 1
-                dp[i][j] = min(
-                    dp[i - 1][j] + 1,
-                    dp[i][j - 1] + 1,
-                    dp[i - 1][j - 1] + cost
-                )
+                dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
         return dp[m][n]
 
     def cer_edits(hyp_str, ref_str):
-        a = list(hyp_str)
-        b = list(ref_str)
+        a = list(hyp_str); b = list(ref_str)
         return edit_distance(a, b), len(b)
 
     for batch in dl:
@@ -375,7 +357,6 @@ def evaluate(model: nn.Module,
         qgrids = batch.get("qgrids")
         keypoints = batch.get("keypoints")
         qgrid_lengths = batch["qgrid_lengths"]
-
 
         y_ids = batch.get("gloss_ids") or batch.get("targets") or batch.get("labels")
         y_text = batch.get("gloss_str") or batch.get("gloss") or batch.get("text")
@@ -433,35 +414,29 @@ def main():
     map_location = torch.device(device)
 
     # Dataset — pass your args directly; note param names on ctor
-    # IMPORTANT: kp_path must point to the exact filename present on disk.
-    # If your file is the INTERPOLATED one, override via --kp_path.
     ds = MultiModalPhoenixDataset(
         image_prefix=args.image_prefix,
         qgrid_prefix=args.qgrid_prefix,
         kp_path=args.kp_path,
-        meta_dir_path=args.meta_dir,         # ctor expects meta_dir_path
-        gloss_dict_path=args.gloss_dict,     # ctor expects gloss_dict_path
+        meta_dir_path=args.meta_dir,     # ctor expects meta_dir_path
+        gloss_dict_path=args.gloss_dict, # ctor expects gloss_dict_path
         split=args.split,
     )
 
-    # Build id2gloss:
+    # id2gloss
     id2gloss = getattr(ds, "id2gloss", None)
     if not isinstance(id2gloss, dict) or len(id2gloss) == 0:
-        # Load from gloss_dict file directly
         id2gloss = load_id2gloss(args.gloss_dict)
 
-    # DataLoader (use dataset's collate if available)
-    collate_fn = getattr(ds, "collate_fn", None)
+    # DataLoader with our robust collate
     dl = DataLoader(
-    ds,
-    batch_size=args.batch_size,
-    shuffle=False,
-    num_workers=args.num_workers,
-    pin_memory=True,
-    collate_fn=collate_mm,   # <- use our robust collate
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_mm,
     )
-
-
 
     # Model
     n_classes = args.force_num_classes or len(id2gloss)
