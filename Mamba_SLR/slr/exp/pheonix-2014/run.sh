@@ -17,31 +17,53 @@
 #   --max_kv 1024 \
 #   --pool_mode mean
 
+
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Use all 4 A40s on a single node
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
-
-# Safer single-node NCCL defaults
 export NCCL_IB_DISABLE=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export MASTER_PORT=${MASTER_PORT:-29531}
-
-# Optional: reduce CPU contention a bit
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
-
-# If your paths are different on this box, change them in ddp_train_multimodal.py or add --image_prefix/--qgrid_prefix flags here
 
 cd ~/Chingiz/SLR_Qgrid/Mamba_SLR
 
+# If you saw worker segfaults before, start with --num_workers 2 (or even 0),
+# and add --freeze_frames_epochs 1 to stabilize at the start.
 torchrun --standalone --nproc_per_node=4 ddp_train_multimodal.py \
   --batch_size 1 \
   --accum 2 \
-  --num_workers 4 \
-  --bf16 \
+  --num_workers 2 \
   --max_kv 1024 \
   --pool_mode mean
+
+
+# #!/usr/bin/env bash
+# set -euo pipefail
+
+# # Use all 4 A40s on a single node
+# export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+
+# # Safer single-node NCCL defaults
+# export NCCL_IB_DISABLE=1
+# export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# export MASTER_PORT=${MASTER_PORT:-29531}
+
+# # Optional: reduce CPU contention a bit
+# export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+
+# # If your paths are different on this box, change them in ddp_train_multimodal.py or add --image_prefix/--qgrid_prefix flags here
+
+# cd ~/Chingiz/SLR_Qgrid/Mamba_SLR
+
+# torchrun --standalone --nproc_per_node=4 ddp_train_multimodal.py \
+#   --batch_size 1 \
+#   --accum 2 \
+#   --num_workers 4 \
+#   --bf16 \
+#   --max_kv 1024 \
+#   --pool_mode mean
 
 
 
