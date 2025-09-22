@@ -21,7 +21,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 4×A40
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+
+# Prevent fragmentation + safer NCCL
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
 export NCCL_IB_DISABLE=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export MASTER_PORT=${MASTER_PORT:-29531}
@@ -29,14 +33,20 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
 cd ~/Chingiz/SLR_Qgrid/Mamba_SLR
 
-# If you saw worker segfaults before, start with --num_workers 2 (or even 0),
-# and add --freeze_frames_epochs 1 to stabilize at the start.
+# Memory-lean config:
+#  - bf16: cuts activations ~½
+#  - num_workers=0: avoids RAM spikes from worker prefetch/decoding
+#  - max_kv 512: smaller KV cache in the fusion/mamba stack
+#  - freeze frame encoder for 1 epoch to reduce grad memory early
 torchrun --standalone --nproc_per_node=4 ddp_train_multimodal.py \
   --batch_size 1 \
   --accum 2 \
-  --num_workers 2 \
-  --max_kv 1024 \
-  --pool_mode mean
+  --num_workers 0 \
+  --bf16 \
+  --max_kv 512 \
+  --pool_mode mean \
+  --freeze_frames_epochs 1
+
 
 
 # #!/usr/bin/env bash
